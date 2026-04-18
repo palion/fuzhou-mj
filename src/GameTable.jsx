@@ -401,7 +401,6 @@ function GameTable({ seats: initialSeats, networking, tweaks, onExit, scoringCfg
     <div style={tableStyles.root(tweaks, rs)}>
       <TableChrome
         round={round} hand={hand} roundWind={state.roundWind}
-        wallRemaining={state.wall.length}
         goldenKey={state.goldenKey}
         scores={scores} seats={seats} turn={state.turn}
         onExit={onExit}
@@ -410,6 +409,7 @@ function GameTable({ seats: initialSeats, networking, tweaks, onExit, scoringCfg
       />
       <div style={tableStyles.tableWrap(rs)}>
         <div style={tableStyles.felt(tweaks, rs)}>
+          <WallDisplay remaining={state.wall.length} rs={rs} />
           {[0, 1, 2, 3].filter((i) => i !== myIdx).map((i) => (
             <OpponentSeat key={i} seat={seats[i]} idx={i}
               position={positionOfSeat(i)} state={state} tweaks={tweaks} rs={rs} />
@@ -446,7 +446,7 @@ function GameTable({ seats: initialSeats, networking, tweaks, onExit, scoringCfg
   );
 }
 
-function TableChrome({ round, hand, roundWind, wallRemaining, goldenKey, scores, seats, turn, onExit, networking, rs }) {
+function TableChrome({ round, hand, roundWind, goldenKey, scores, seats, turn, onExit, networking, rs }) {
   const windCh = { E: '東', S: '南', W: '西', N: '北' }[roundWind];
   const goldenTile = goldenKey ? parseGoldenKey(goldenKey) : null;
   const friends = networking?.role === 'host' ? (networking.connections ? networking.connections.size : 0) : null;
@@ -459,10 +459,6 @@ function TableChrome({ round, hand, roundWind, wallRemaining, goldenKey, scores,
         <div style={tableStyles.matchBadge(rs)}>
           <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 15 : 20, color: '#e0c97e' }}>{windCh}場</div>
           <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 9 : 10, color: '#8aa699', letterSpacing: 2 }}>R{round}·{hand}</div>
-        </div>
-        <div style={tableStyles.wallBadge(rs)}>
-          <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 9 : 11, color: '#8aa699', letterSpacing: 1 }}>WALL</div>
-          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 16 : 22, color: '#e8ebe7' }}>{wallRemaining}</div>
         </div>
         {goldenTile && (
           <div style={tableStyles.goldenBadge(rs)} title={`Golden (wild): ${tileDesc(goldenTile)}`}>
@@ -533,6 +529,9 @@ function OpponentSeat({ seat, idx, position, state, tweaks, rs }) {
     flexDirection: position === 'left' || position === 'right' ? 'column' : 'row',
     gap: 2, justifyContent: 'center', alignItems: 'center',
   };
+  // Render a stable number of face-down tiles keyed by slot index. Since face-down tiles are
+  // visually identical, this prevents DOM churn (and the flicker) when a mid-hand tile is discarded.
+  const slots = Array.from({ length: hand.length });
   return (
     <div style={tableStyles.opponentBlock(position, rs)}>
       <div style={tableStyles.opponentLabel(position, isTurn)}>
@@ -547,8 +546,8 @@ function OpponentSeat({ seat, idx, position, state, tweaks, rs }) {
         {oppFlowers.length > 0 && <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 11, color: '#b0302b' }}>花·{oppFlowers.length}</span>}
       </div>
       <div style={handStyle}>
-        {hand.map((t) => (
-          <Tile key={t.id} tile={t} size={size} face="down" rotate={rotate} />
+        {slots.map((_, i) => (
+          <Tile key={i} size={size} face="down" rotate={rotate} />
         ))}
       </div>
       {melds.length > 0 && (
@@ -599,13 +598,53 @@ function CenterPond({ state, tweaks, myIdx, rs }) {
           </div>
         </div>
       ))}
-      {!rs.isPhone && (
-        <div style={tableStyles.centerDisc(rs)}>
-          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isTablet ? 14 : 18, color: '#c1a96d', opacity: 0.6 }}>福州</div>
-          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isTablet ? 11 : 14, color: '#c1a96d', opacity: 0.5, letterSpacing: 4 }}>麻將</div>
-        </div>
-      )}
+      <div style={tableStyles.centerDisc(rs)}>
+        <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 9 : 10, color: '#c1a96d', opacity: 0.7, letterSpacing: 2 }}>WALL</div>
+        <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 20 : rs.isTablet ? 22 : 28, color: '#e0c97e', fontWeight: 600 }}>{state.wall.length}</div>
+      </div>
     </div>
+  );
+}
+
+// Face-down tile wall hugging the four edges of the felt. Each visual tile stands in for 2 real tiles
+// (the traditional 2-high mahjong stack), so all ~72 starting wall tiles fit without overlapping the
+// opponent/pond/my-seat zones.
+function WallDisplay({ remaining, rs }) {
+  if (rs.isPhone || remaining <= 0) return null;
+  const stacks = Math.ceil(remaining / 2);
+  const per = Math.floor(stacks / 4);
+  const rem = stacks % 4;
+  // Distribute: 0=top, 1=right, 2=bottom, 3=left. Drain from top first as the wall depletes.
+  const counts = [0, 1, 2, 3].map((i) => per + (i < rem ? 1 : 0));
+  // Tiles stack flush in both directions — no rotation on the vertical strips, because
+  // CSS rotate leaves the layout box at 28×38 and opens a 10px gap between each rotated tile.
+  // Portrait xs tiles stacked vertically still read as a wall of tiles along the edge.
+  const StackRow = ({ n, vertical }) => (
+    <div style={{
+      display: 'flex',
+      flexDirection: vertical ? 'column' : 'row',
+      gap: 1,
+      justifyContent: 'center', alignItems: 'center',
+      pointerEvents: 'none',
+    }}>
+      {Array.from({ length: n }).map((_, i) => (
+        <div key={i} style={{ position: 'relative' }}>
+          {/* Stack-of-2 look: a slightly offset shadow tile under the front tile */}
+          <div style={{ position: 'absolute', top: 2, left: 2, opacity: 0.55 }}>
+            <Tile size="xs" face="down" />
+          </div>
+          <Tile size="xs" face="down" />
+        </div>
+      ))}
+    </div>
+  );
+  return (
+    <>
+      <div style={tableStyles.wallTop(rs)}><StackRow n={counts[0]} /></div>
+      <div style={tableStyles.wallRight(rs)}><StackRow n={counts[1]} vertical /></div>
+      <div style={tableStyles.wallBottom(rs)}><StackRow n={counts[2]} /></div>
+      <div style={tableStyles.wallLeft(rs)}><StackRow n={counts[3]} vertical /></div>
+    </>
   );
 }
 
@@ -616,8 +655,23 @@ function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, sele
   const drawn = state.lastDrawn && state.lastDrawn.player === myIdx ? state.lastDrawn.tile : null;
   const sorted = drawn ? sortTiles(hand.filter((t) => t.id !== drawn.id)) : hand;
   const goldenKey = state.goldenKey;
-  const tileSize = rs.isPhone ? 'md' : 'lg';
-  const meldSize = rs.isPhone ? 'xs' : 'sm';
+  // Pick the largest tile size that lets the full hand (plus draw + melds) fit without scrolling.
+  // Tile widths: xs=28, sm=36, md=46, lg=56. Reserve space for gaps + melds + flowers + padding.
+  const totalSlots = sorted.length + (drawn ? 1 : 0);
+  const meldTileCount = melds.reduce((a, m) => a + m.tiles.length, 0);
+  const available = Math.max(280, rs.w - 32);
+  const fitTile = (tileW, gap, meldW) => {
+    const meldsW = meldTileCount > 0 ? (meldTileCount * meldW + 20) : 0;
+    return totalSlots * (tileW + gap) + meldsW + 24 <= available;
+  };
+  let tileSize;
+  if (!rs.isPhone && fitTile(56, 3, 36)) tileSize = 'lg';
+  else if (fitTile(46, 3, 28)) tileSize = 'md';
+  else if (fitTile(36, 2, 28)) tileSize = 'sm';
+  else tileSize = 'xs';
+  const meldSize = (tileSize === 'lg' || tileSize === 'md') ? 'sm' : 'xs';
+  const badgeSize = tileSize === 'lg' ? 18 : tileSize === 'md' ? 16 : 14;
+  const useTilt = tileSize === 'lg' || tileSize === 'md';
 
   return (
     <div style={tableStyles.mySeat(rs)}>
@@ -637,7 +691,7 @@ function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, sele
           const gold = goldenKey && tileKey(t) === goldenKey;
           return (
             <div key={t.id} style={{ position: 'relative', flexShrink: 0 }}>
-              <Tile tile={t} size={tileSize} tilt={!rs.isPhone}
+              <Tile tile={t} size={tileSize} tilt={useTilt}
                 selected={selectedTileId === t.id}
                 glow={selectedTileId === t.id ? 'rgba(224,201,126,.95)' : (gold ? 'rgba(224,201,126,.55)' : null)}
                 onClick={isMyTurn ? () => {
@@ -645,7 +699,7 @@ function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, sele
                   else setSelectedTileId(t.id);
                 } : null}
                 dim={!isMyTurn} />
-              {gold && <GoldenBadge size={rs.isPhone ? 14 : 18} />}
+              {gold && <GoldenBadge size={badgeSize} />}
             </div>
           );
         })}
@@ -653,7 +707,7 @@ function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, sele
           <>
             <div style={{ width: rs.isPhone ? 6 : 12, flexShrink: 0 }} />
             <div style={{ position: 'relative', flexShrink: 0 }}>
-              <Tile tile={drawn} size={tileSize} tilt={!rs.isPhone}
+              <Tile tile={drawn} size={tileSize} tilt={useTilt}
                 selected={selectedTileId === drawn.id}
                 glow={'rgba(224,201,126,.95)'}
                 onClick={isMyTurn ? () => {
@@ -661,7 +715,7 @@ function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, sele
                   else setSelectedTileId(drawn.id);
                 } : null}
                 dim={!isMyTurn} />
-              {goldenKey && tileKey(drawn) === goldenKey && <GoldenBadge size={rs.isPhone ? 14 : 18} />}
+              {goldenKey && tileKey(drawn) === goldenKey && <GoldenBadge size={badgeSize} />}
             </div>
           </>
         )}
@@ -832,10 +886,6 @@ const tableStyles = {
     display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
     padding: rs.isPhone ? '2px 8px' : '4px 12px', borderLeft: '2px solid #2a3a30',
   }),
-  wallBadge: (rs) => ({
-    display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
-    padding: rs.isPhone ? '2px 8px' : '4px 12px', borderLeft: '2px solid #2a3a30',
-  }),
   goldenBadge: (rs) => ({
     display: 'flex', flexDirection: 'column',
     padding: rs.isPhone ? '2px 8px' : '4px 12px', borderLeft: '2px solid #2a3a30',
@@ -887,7 +937,8 @@ const tableStyles = {
   }),
   opponentBlock: (pos, rs) => {
     const base = { position: 'absolute', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 };
-    const inset = rs && rs.isTablet ? 8 : 16;
+    // Opponents sit inside the outer wall ring.
+    const inset = rs && rs.isTablet ? 52 : 72;
     if (pos === 'top') return { ...base, top: inset, left: '50%', transform: 'translateX(-50%)' };
     if (pos === 'left') return { ...base, left: inset, top: '50%', transform: 'translateY(-50%)' };
     if (pos === 'right') return { ...base, right: inset, top: '50%', transform: 'translateY(-50%)' };
@@ -930,10 +981,43 @@ const tableStyles = {
   centerDisc: (rs) => ({
     gridArea: 'center',
     display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-    background: 'rgba(0,0,0,.2)',
-    border: '1px solid rgba(193,169,109,.15)',
+    gap: 2,
+    background: 'rgba(0,0,0,.35)',
+    border: '1px solid rgba(193,169,109,.25)',
     borderRadius: '50%',
-    width: rs.isTablet ? 80 : 120, height: rs.isTablet ? 80 : 120, margin: 'auto',
+    width: rs.isPhone ? 60 : rs.isTablet ? 80 : 110,
+    height: rs.isPhone ? 60 : rs.isTablet ? 80 : 110,
+    margin: 'auto',
+  }),
+  // Visual tile wall hugging the inside edge of the felt. Each side gets ~1/4 of the wall; drained evenly.
+  // Opponents sit INSIDE this ring (see opponentBlock inset), and the pond sits further inside still.
+  wallTop: (rs) => ({
+    position: 'absolute',
+    top: rs.isTablet ? 10 : 14,
+    left: 0, right: 0,
+    display: 'flex', justifyContent: 'center',
+    pointerEvents: 'none',
+  }),
+  wallBottom: (rs) => ({
+    position: 'absolute',
+    bottom: rs.isTablet ? 210 : 240,
+    left: 0, right: 0,
+    display: 'flex', justifyContent: 'center',
+    pointerEvents: 'none',
+  }),
+  wallLeft: (rs) => ({
+    position: 'absolute',
+    left: rs.isTablet ? 10 : 14,
+    top: 0, bottom: 0,
+    display: 'flex', alignItems: 'center',
+    pointerEvents: 'none',
+  }),
+  wallRight: (rs) => ({
+    position: 'absolute',
+    right: rs.isTablet ? 10 : 14,
+    top: 0, bottom: 0,
+    display: 'flex', alignItems: 'center',
+    pointerEvents: 'none',
   }),
   mySeat: (rs) => ({
     position: 'absolute',
