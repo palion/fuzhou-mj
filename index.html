@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fuzhou Mahjong · 福州麻將</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Serif+SC:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #05080a; color: #e8ebe7; font-family: 'Inter', system-ui, sans-serif; overflow: hidden; height: 100%; }
+  button:focus { outline: none; }
+  button:hover { filter: brightness(1.1); }
+  input, textarea { font: inherit; }
+  .mj-tile:hover { transform: translateY(-4px) !important; transition: transform .15s ease; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #2a3a30; border-radius: 4px; }
+
+  .tweaks-fab {
+    position: fixed; top: 16px; right: 16px;
+    width: 40px; height: 40px; border-radius: 50%;
+    background: rgba(0,0,0,.4); border: 1px solid #2a3a30;
+    color: #e0c97e; font-size: 18px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 40;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+<script type="text/babel" data-presets="env,react" src="src/tiles.jsx"></script>
+<script type="text/babel" data-presets="env,react" src="src/engine.jsx"></script>
+<script type="text/babel" data-presets="env,react" src="src/scoring.jsx"></script>
+<script type="text/babel" data-presets="env,react" src="src/ai.jsx"></script>
+<script type="text/babel" data-presets="env,react" src="src/network.jsx"></script>
+<script type="text/babel" data-presets="env,react" src="src/Lobby.jsx"></script>
+<script type="text/babel" data-presets="env,react" src="src/GameTable.jsx"></script>
+<script type="text/babel" data-presets="env,react" src="src/Tweaks.jsx"></script>
+
+<script type="text/babel" data-presets="env,react">
+const DEFAULT_TWEAKS = /*EDITMODE-BEGIN*/{
+  "theme": "dark",
+  "tilt": true,
+  "animIntensity": "normal",
+  "density": "normal",
+  "tileStyle": "ivory",
+  "layout": "standard"
+}/*EDITMODE-END*/;
+
+function App() {
+  const [mode, setMode] = React.useState('lobby');
+  const [session, setSession] = React.useState(null);
+  const [tweaks, setTweaks] = React.useState(DEFAULT_TWEAKS);
+  const [scoringCfg, setScoringCfg] = React.useState(DEFAULT_SCORING);
+  const [tweaksOpen, setTweaksOpen] = React.useState(false);
+  const [editModeActive, setEditModeActive] = React.useState(false);
+
+  React.useEffect(() => {
+    const handler = (ev) => {
+      const d = ev.data;
+      if (!d) return;
+      if (d.type === '__activate_edit_mode') { setEditModeActive(true); setTweaksOpen(true); }
+      if (d.type === '__deactivate_edit_mode') { setEditModeActive(false); setTweaksOpen(false); }
+    };
+    window.addEventListener('message', handler);
+    window.parent.postMessage({ type: '__edit_mode_available' }, '*');
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
+  const updateTweaks = (next) => {
+    setTweaks(next);
+    window.parent.postMessage({ type: '__edit_mode_set_keys', edits: next }, '*');
+  };
+
+  const onStart = ({ seats, networking }) => {
+    setSession({ seats, networking: networking || null });
+    setMode('game');
+  };
+
+  const onExitGame = () => {
+    if (session && session.networking && session.networking.close) {
+      try { session.networking.close(); } catch {}
+    }
+    setMode('lobby');
+    setSession(null);
+    if (window.location.hash) history.replaceState(null, '', window.location.pathname);
+  };
+
+  return (
+    <>
+      {mode === 'lobby' && <Lobby tweaks={tweaks} onStart={onStart} />}
+      {mode === 'game' && session && (
+        <GameTable
+          seats={session.seats}
+          networking={session.networking}
+          tweaks={tweaks}
+          scoringCfg={scoringCfg}
+          onExit={onExitGame}
+        />
+      )}
+      {mode === 'game' && !tweaksOpen && (
+        <button className="tweaks-fab" onClick={() => setTweaksOpen(true)} title="Tweaks">⚙</button>
+      )}
+      {tweaksOpen && (
+        <TweaksPanel
+          tweaks={tweaks}
+          setTweaks={updateTweaks}
+          scoringCfg={scoringCfg}
+          setScoringCfg={setScoringCfg}
+          onClose={() => setTweaksOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
