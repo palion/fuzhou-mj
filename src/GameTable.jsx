@@ -243,14 +243,12 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
     setHuBtnReady(state.phase === 'discard' && state.turn === myIdx && canDeclareHu(state, myIdx));
   }, [state, isClient]);
 
-  // End-of-hand scoring (host/solo)
+  // End-of-hand scoring. Host/solo drives score deltas; clients only render locally computed modal.
   React.useEffect(() => {
-    if (isClient) return;
     if (state.phase !== 'end' || showScore) return;
     const result = state.hu ? scoreHand(state, scoringCfg) : null;
-    const payload = { state, result };
-    setShowScore(payload);
-    if (result) {
+    setShowScore({ state, result });
+    if (!isClient && result) {
       const pay = paymentDeltas(result, state);
       setScores((sc) => sc.map((v, i) => v + pay.deltas[i]));
     }
@@ -316,6 +314,7 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
     let newDealer = state.dealer;
     let newRound = round, newHand = hand;
     const dealerWon = state.hu && state.hu.winner === state.dealer;
+    const newStreak = dealerWon ? (state.dealerStreak || 0) + 1 : 0;
     if (!dealerWon) {
       newDealer = (state.dealer + 1) % 4;
       newHand++;
@@ -327,7 +326,7 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
     const roundWinds = ['E', 'S', 'W', 'N'];
     const seatWinds = [];
     for (let i = 0; i < 4; i++) seatWinds[(newDealer + i) % 4] = roundWinds[i];
-    const fresh = newGame({ seed: Date.now(), dealer: newDealer, roundWind: roundWinds[newRound - 1], seatWinds });
+    const fresh = newGame({ seed: Date.now(), dealer: newDealer, roundWind: roundWinds[newRound - 1], seatWinds, dealerStreak: newStreak });
     setState(fresh);
     if (role === 'host') networking.broadcast({ type: 'next-hand' });
   };
@@ -628,15 +627,27 @@ function ScoreModal({ payload, seats, onNext, hideNext }) {
               {result.selfDraw ? '自摸' : `放炮 by ${seats[result.from].name}`}
             </div>
             <div style={{ display: 'grid', gap: 8, marginTop: 20 }}>
-              {result.fans.map((f, i) => (
-                <div key={i} style={tableStyles.fanRow}>
-                  <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 16, color: '#e8ebe7' }}>{f.name}</span>
-                  <span style={{ fontFamily: 'Inter', fontSize: 13, color: '#e0c97e', fontWeight: 600 }}>+{f.value}番</span>
+              {(result.breakdown || []).map((f, i) => (
+                <div key={`b${i}`} style={tableStyles.fanRow}>
+                  <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 15, color: '#c3d3ca' }}>{f.name}</span>
+                  <span style={{ fontFamily: 'Inter', fontSize: 13, color: '#e0c97e' }}>+{f.value}</span>
+                </div>
+              ))}
+              {result.breakdown && (
+                <div style={{ ...tableStyles.fanRow, borderTop: '1px dashed #2a3a30', paddingTop: 8 }}>
+                  <span style={{ fontFamily: 'Inter', fontSize: 12, color: '#8aa699' }}>Subtotal × 2</span>
+                  <span style={{ fontFamily: 'Inter', fontSize: 14, color: '#c3d3ca' }}>{result.multiplierSum} × 2 = {result.multiplied}</span>
+                </div>
+              )}
+              {(result.specials || []).map((f, i) => (
+                <div key={`s${i}`} style={tableStyles.fanRow}>
+                  <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 15, color: '#e8ebe7' }}>{f.name}</span>
+                  <span style={{ fontFamily: 'Inter', fontSize: 13, color: '#e0c97e', fontWeight: 600 }}>+{f.value}</span>
                 </div>
               ))}
               <div style={{ ...tableStyles.fanRow, borderTop: '1px solid #2a3a30', marginTop: 8, paddingTop: 12 }}>
-                <span style={{ fontFamily: 'Inter', fontSize: 14, color: '#8aa699' }}>Total</span>
-                <span style={{ fontFamily: 'Inter', fontSize: 20, color: '#e0c97e', fontWeight: 700 }}>{result.totalFans}番 · {result.totalPoints} pts</span>
+                <span style={{ fontFamily: 'Inter', fontSize: 14, color: '#8aa699' }}>Total {result.selfDraw ? 'each opponent pays' : 'discarder pays'}</span>
+                <span style={{ fontFamily: 'Inter', fontSize: 22, color: '#e0c97e', fontWeight: 700 }}>{result.totalPoints} 分</span>
               </div>
             </div>
           </>

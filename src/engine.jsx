@@ -20,7 +20,7 @@ function shuffle(arr, rng) {
   return a;
 }
 
-function newGame({ seed = Date.now(), dealer = 0, roundWind = 'E', seatWinds = ['E', 'S', 'W', 'N'] } = {}) {
+function newGame({ seed = Date.now(), dealer = 0, roundWind = 'E', seatWinds = ['E', 'S', 'W', 'N'], dealerStreak = 0 } = {}) {
   const rng = mkRng(seed);
   const wall = shuffle(buildWallSpec(), rng);
   const hands = [[], [], [], []];
@@ -39,7 +39,6 @@ function newGame({ seed = Date.now(), dealer = 0, roundWind = 'E', seatWinds = [
         flowers[p].push(hands[p].splice(i, 1)[0]);
       }
     }
-    // keep drawing replacements from back until no flower
     while (true) {
       const needed = (p === dealer ? 17 : 16) - hands[p].length;
       if (needed <= 0) break;
@@ -49,16 +48,14 @@ function newGame({ seed = Date.now(), dealer = 0, roundWind = 'E', seatWinds = [
       else hands[p].push(t);
     }
   };
-  // rotate starting at dealer
   for (let i = 0; i < 4; i++) replaceFlowers((dealer + i) % 4);
 
-  // Determine Golden tile (金): reveal top of wall, the tile "next" in sequence is the wild
-  // Common Fuzhou rule: flip a tile; the NEXT tile (numerically next, or next wind/dragon) is golden.
+  // Golden tile: flip indicator, next-in-sequence is the wild
   const indicatorIdx = Math.floor(rng() * wall.length);
   const indicator = wall[indicatorIdx];
   const goldenKey = nextTileKey(indicator);
 
-  return {
+  const state = {
     wall, hands, flowers,
     melds: [[], [], [], []],
     discards: [[], [], [], []],
@@ -67,9 +64,40 @@ function newGame({ seed = Date.now(), dealer = 0, roundWind = 'E', seatWinds = [
     lastDiscard: null, lastDrawn: null, justDiscarded: false,
     hu: null, kongPending: null,
     log: [],
-    indicator, goldenKey,  // the wild card KEY (e.g. "m5")
-    instantPoints: [0, 0, 0, 0], // for flowers/kongs
+    indicator, goldenKey,
+    instantPoints: [0, 0, 0, 0],
+    dealerStreak,
+    discardCount: 0,
+    claimsMade: 0,
+    selfDrawOnly: [false, false, false, false],
   };
+
+  // Blessing of Heaven: dealer's initial 17 tiles form a winning hand
+  if (isWinningHand(hands[dealer], 0, goldenKey)) {
+    state.hu = { winner: dealer, from: dealer, tile: hands[dealer][hands[dealer].length - 1], selfDraw: true, blessing: 'heaven' };
+    state.phase = 'end';
+    state.log.push(`${seatName(dealer)} 天胡！`);
+    return state;
+  }
+
+  // Robbing the Gold: non-dealer whose 16 tiles + one gold forms a winning hand
+  // Priority: nearest to dealer CCW.
+  const goldSuit = goldenKey[0];
+  const goldRest = goldenKey.slice(1);
+  const goldN = (goldSuit === 'm' || goldSuit === 'p' || goldSuit === 's') ? parseInt(goldRest) : goldRest;
+  for (let i = 1; i < 4; i++) {
+    const p = (dealer + i) % 4;
+    const fakeGold = { suit: goldSuit, n: goldN, id: `robbed_gold_${p}` };
+    if (isWinningHand([...hands[p], fakeGold], 0, goldenKey)) {
+      hands[p].push(fakeGold);
+      state.hu = { winner: p, from: p, tile: fakeGold, selfDraw: true, robbingGold: true };
+      state.phase = 'end';
+      state.log.push(`${seatName(p)} 抢金！`);
+      return state;
+    }
+  }
+
+  return state;
 }
 
 // What's the "next" tile key for the golden indicator?
@@ -240,42 +268,70 @@ function canFormSetsWild(counts, needed, wilds) {
   return false;
 }
 
-// Decompose a winning hand into its sets for scoring
-function decomposeHand(tiles, melds) {
-  // Returns { pair, sets: [{type:'pung'|'chow'|'kong', tiles, exposed}], ok }
-  // Try each pair; find first decomposition.
+// Decompose a winning hand into its sets for scoring.
+// Fuzhou: 5 sets + 1 pair (17 tiles). Handles gold tiles as wildcards.
+// Returns { ok, pair: {key, tile, wilds}, concealedSets: [{type, key, wilds}], melds }
+function decomposeHand(tiles, melds, goldenKey = null) {
   const exposedCount = melds.length;
+  const needSets = 5 - exposedCount;
+
+  // Separate gold tiles; they'll be placed as wilds
+  let golds = 0;
+  const regular = [];
+  for (const t of tiles) {
+    if (goldenKey && tileKey(t) === goldenKey) golds++;
+    else regular.push(t);
+  }
   const counts = {};
   const tileByKey = {};
-  for (const t of tiles) {
+  for (const t of regular) {
     const k = tileKey(t);
     counts[k] = (counts[k] || 0) + 1;
     if (!tileByKey[k]) tileByKey[k] = t;
   }
 
-  function findSets(countObj, acc) {
+  function findSets(countObj, remainWilds, acc) {
+    if (acc.length === needSets) {
+      const allZero = Object.values(countObj).every((v) => v === 0);
+      return (allZero && remainWilds === 0) ? [...acc] : null;
+    }
     const keys = Object.keys(countObj).sort();
     let firstKey = null;
     for (const k of keys) if (countObj[k] > 0) { firstKey = k; break; }
-    if (!firstKey) return acc.length === 4 - exposedCount ? [...acc] : null;
-
-    // pung
-    if (countObj[firstKey] >= 3) {
-      countObj[firstKey] -= 3;
-      const r = findSets(countObj, [...acc, { type: 'pung', key: firstKey }]);
-      countObj[firstKey] += 3;
+    if (!firstKey) {
+      // No regulars left — consume wilds as pung triplets
+      if (remainWilds >= 3) {
+        return findSets(countObj, remainWilds - 3, [...acc, { type: 'pung', key: 'GOLD', wilds: 3 }]);
+      }
+      return null;
+    }
+    // Pung with 0–3 wilds
+    for (let w = 0; w <= 3; w++) {
+      const needReg = 3 - w;
+      if (w > remainWilds || countObj[firstKey] < needReg) continue;
+      countObj[firstKey] -= needReg;
+      const r = findSets(countObj, remainWilds - w, [...acc, { type: 'pung', key: firstKey, wilds: w }]);
+      countObj[firstKey] += needReg;
       if (r) return r;
     }
-    // chow
+    // Chow (suits only)
     const suit = firstKey[0];
     if (suit === 'm' || suit === 'p' || suit === 's') {
       const n = parseInt(firstKey.slice(1));
       if (n <= 7) {
         const k2 = `${suit}${n+1}`, k3 = `${suit}${n+2}`;
-        if ((countObj[k2] || 0) > 0 && (countObj[k3] || 0) > 0) {
-          countObj[firstKey]--; countObj[k2]--; countObj[k3]--;
-          const r = findSets(countObj, [...acc, { type: 'chow', key: firstKey }]);
-          countObj[firstKey]++; countObj[k2]++; countObj[k3]++;
+        for (let w2 = 0; w2 <= 1; w2++) for (let w3 = 0; w3 <= 1; w3++) {
+          const used = w2 + w3;
+          if (used > remainWilds) continue;
+          const have2 = countObj[k2] || 0, have3 = countObj[k3] || 0;
+          if ((w2 === 0 && have2 < 1) || (w3 === 0 && have3 < 1)) continue;
+          countObj[firstKey]--;
+          if (w2 === 0) countObj[k2]--;
+          if (w3 === 0) countObj[k3]--;
+          const r = findSets(countObj, remainWilds - used, [...acc, { type: 'chow', key: firstKey, wilds: used }]);
+          countObj[firstKey]++;
+          if (w2 === 0) countObj[k2]++;
+          if (w3 === 0) countObj[k3]++;
           if (r) return r;
         }
       }
@@ -283,46 +339,54 @@ function decomposeHand(tiles, melds) {
     return null;
   }
 
+  // Try pair from regular pair
   for (const pk of Object.keys(counts)) {
     if (counts[pk] >= 2) {
       counts[pk] -= 2;
-      const sets = findSets(counts, []);
+      const sets = findSets(counts, golds, []);
       counts[pk] += 2;
-      if (sets) {
-        return {
-          ok: true,
-          pair: { key: pk, tile: tileByKey[pk] },
-          concealedSets: sets,
-          melds,
-        };
-      }
+      if (sets) return { ok: true, pair: { key: pk, tile: tileByKey[pk], wilds: 0 }, concealedSets: sets, melds };
     }
+    // Pair = 1 regular + 1 wild
+    if (counts[pk] >= 1 && golds >= 1) {
+      counts[pk] -= 1;
+      const sets = findSets(counts, golds - 1, []);
+      counts[pk] += 1;
+      if (sets) return { ok: true, pair: { key: pk, tile: tileByKey[pk], wilds: 1 }, concealedSets: sets, melds };
+    }
+  }
+  // Pair = 2 wilds (Golden Pair)
+  if (golds >= 2) {
+    const sets = findSets(counts, golds - 2, []);
+    if (sets) return { ok: true, pair: { key: 'GOLD', tile: null, wilds: 2 }, concealedSets: sets, melds };
   }
   return { ok: false };
 }
 
-// Available claims when a tile is discarded
+// Available claims when a tile is discarded.
+// Fuzhou: gold tile cannot be claimed for Chi/Pong/Kong. Hu-by-claim is blocked
+// for players who've discarded a gold earlier (selfDrawOnly).
 function availableClaims(state, discardedTile, fromPlayer) {
-  const claims = []; // {player, type, option?}
+  const claims = [];
+  const isGold = state.goldenKey && tileKey(discardedTile) === state.goldenKey;
   for (let p = 0; p < 4; p++) {
     if (p === fromPlayer) continue;
     const hand = state.hands[p];
-    const exposedCount = state.melds[p].filter((m) => m.type !== 'kong' || !m.concealed).length;
-    // Win (Hu / Ron)
-    const test = [...hand, discardedTile];
-    if (isWinningHand(test, state.melds[p].length, state.goldenKey)) {
-      claims.push({ player: p, type: 'hu', tile: discardedTile, from: fromPlayer });
+    // Hu (放炮) — even on a discarded gold, winning-via-claim is allowed unless the claimant previously discarded gold.
+    if (!state.selfDrawOnly[p]) {
+      const test = [...hand, discardedTile];
+      if (isWinningHand(test, state.melds[p].length, state.goldenKey)) {
+        claims.push({ player: p, type: 'hu', tile: discardedTile, from: fromPlayer });
+      }
     }
-    // Pong
+    if (isGold) continue; // Gold cannot form Chi/Pong/Kong from a discard
     const same = hand.filter((t) => tileKey(t) === tileKey(discardedTile));
     if (same.length >= 2) {
       claims.push({ player: p, type: 'pong', tile: discardedTile, from: fromPlayer });
     }
-    // Kong (exposed)
     if (same.length >= 3) {
       claims.push({ player: p, type: 'kong', tile: discardedTile, from: fromPlayer });
     }
-    // Chi — only from player to the left (prev player, i.e. (p-1+4)%4 === fromPlayer means p is "right of discarder")
     if ((fromPlayer + 1) % 4 === p && (discardedTile.suit === 'm' || discardedTile.suit === 'p' || discardedTile.suit === 's')) {
       const n = discardedTile.n;
       const has = (k) => hand.some((t) => tileKey(t) === k);
@@ -340,7 +404,8 @@ function availableClaims(state, discardedTile, fromPlayer) {
 
 // Apply claim (mutating state). Returns new state.
 function applyClaim(state, claim) {
-  const s = { ...state, hands: state.hands.map(h => [...h]), melds: state.melds.map(m => [...m]), discards: state.discards.map(d => [...d]), flowers: state.flowers.map(f => [...f]), instantPoints: [...state.instantPoints] };
+  const s = { ...state, hands: state.hands.map(h => [...h]), melds: state.melds.map(m => [...m]), discards: state.discards.map(d => [...d]), flowers: state.flowers.map(f => [...f]), instantPoints: [...state.instantPoints], selfDrawOnly: [...state.selfDrawOnly] };
+  if (claim.type !== 'hu') s.claimsMade = (s.claimsMade || 0) + 1;
   const p = claim.player;
   const tile = claim.tile;
 
@@ -426,7 +491,7 @@ function drawTile(state, player) {
 }
 
 function discardTile(state, player, tileId) {
-  const s = { ...state, hands: state.hands.map(h => [...h]), discards: state.discards.map(d => [...d]) };
+  const s = { ...state, hands: state.hands.map(h => [...h]), discards: state.discards.map(d => [...d]), selfDrawOnly: [...state.selfDrawOnly] };
   const idx = s.hands[player].findIndex((t) => t.id === tileId);
   if (idx < 0) return state;
   const t = s.hands[player].splice(idx, 1)[0];
@@ -435,6 +500,12 @@ function discardTile(state, player, tileId) {
   s.phase = 'claim';
   s.justDiscarded = true;
   s.lastDrawn = null;
+  s.discardCount = (s.discardCount || 0) + 1;
+  // Discarding a gold tile: discarder can only win by self-draw for the rest of the hand
+  if (s.goldenKey && tileKey(t) === s.goldenKey) {
+    s.selfDrawOnly[player] = true;
+    s.log.push(`${seatName(player)} 打金 — 只能自摸`);
+  }
   return s;
 }
 
@@ -516,7 +587,14 @@ function canDeclareHu(state, player) {
 
 function declareHu(state, player) {
   const s = { ...state };
-  s.hu = { winner: player, from: player, tile: s.hands[player][s.hands[player].length - 1], selfDraw: true };
+  const huTile = s.hands[player][s.hands[player].length - 1];
+  let blessing = null;
+  // Blessing of Earth: non-dealer wins on their first draw with no prior claims and only dealer's first discard
+  if (player !== s.dealer && s.discardCount === 1 && (s.claimsMade || 0) === 0) {
+    blessing = 'earth';
+    s.log.push(`${seatName(player)} 地胡！`);
+  }
+  s.hu = { winner: player, from: player, tile: huTile, selfDraw: true, blessing };
   s.phase = 'end';
   return s;
 }

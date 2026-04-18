@@ -46,7 +46,8 @@ function estimateShanten(hand, melds) {
       if (a > 0 && b > 0) partials++;
     }
   }
-  const setsNeeded = 4 - melds.length - triplets;
+  // Fuzhou: 5 sets + 1 pair
+  const setsNeeded = 5 - melds.length - triplets;
   return Math.max(0, setsNeeded * 2 - pairs - partials);
 }
 
@@ -88,12 +89,11 @@ function decideClaim(claims, state, personality = AI_PERSONALITIES.balanced) {
 
   if (kong && personality.speed > 0.5) return kong;
   if (pong) {
-    // Take pong if speeds us up or hand is focused on pungs
-    const keepExposed = personality.agg > 0.3 && shanten <= 5;
+    // Take pong if speeds us up or hand is focused on pungs (5-set Fuzhou raises threshold)
+    const keepExposed = personality.agg > 0.3 && shanten <= 7;
     if (keepExposed) return pong;
   }
-  if (chi && personality.speed > 0.6 && shanten <= 4) {
-    // prefer middle chi options
+  if (chi && personality.speed > 0.6 && shanten <= 6) {
     return chi;
   }
   return null; // pass

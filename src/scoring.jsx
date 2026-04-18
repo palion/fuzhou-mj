@@ -1,158 +1,127 @@
-// Fuzhou 十六番 scoring (simplified but playable)
-// Score in 番 (fans). 1 fan ≈ base points; capped at 16.
-// House-rules configurable via scoringConfig.
+// Fuzhou Mahjong scoring.
+// Payout = ((Base + Flower + Gold + DealerCont + Kong) × 2) + Special Hand Points
+// Self-draw: every opponent pays; Discard-pay: only discarder pays.
 
 const DEFAULT_SCORING = {
-  basePoints: 1,          // points per fan (non-dealer non-self-draw)
-  limitFans: 16,          // 番上限
-  cleanHand: 4,           // 清一色 (all one suit)
-  mixedOneSuit: 2,        // 混一色
-  allPungs: 2,            // 碰碰胡
-  allHonors: 8,           // 字一色
-  allTerminals: 8,        // 幺九
-  sevenPairs: 4,          // 七对
-  bigThreeDragons: 8,     // 大三元
-  smallThreeDragons: 4,   // 小三元
-  bigFourWinds: 16,       // 大四喜
-  smallFourWinds: 8,      // 小四喜
-  dragonTriplet: 1,       // each 箭刻 (dragon pung)
-  seatWindPung: 1,        // 门风刻
-  roundWindPung: 1,       // 圈风刻
-  concealed: 1,           // 门清
-  selfDraw: 1,            // 自摸
-  lastTile: 1,            // 海底捞月
-  robbingKong: 1,         // 抢杠
-  kongBonus: 1,           // 杠上开花
-  heavenlyHand: 16,       // 天胡
-  earthlyHand: 8,         // 地胡
-  pureTerminals: 16,      // 清幺九
+  basePoints: 5,
+  flowerPerTile: 1,
+  goldPerTile: 1,
+  dealerContinuationPerHand: 1,
+  openKong: 1,
+  concealedKong: 2,
+  fullBloom: 6,             // 4-of-a-kind flowers/seasons or 4-of-a-kind same wind/dragon
+  allSequences: 10,         // 平胡
+  oneFlower: 15,            // 只有一张花
+  goldenPair: 20,           // 金雀 (pair = 2 golds)
+  threeGoldKnockdown: 30,   // 三金倒 (3 golds, not as triplet)
+  goldenDragon: 40,         // 金龙 (3 golds as a concealed triplet)
+  robbingTheGold: 50,       // 抢金
+  blessingOfEarth: 40,      // 地胡
+  blessingOfHeaven: 50,     // 天胡
 };
 
 function scoreHand(state, cfg = DEFAULT_SCORING) {
-  if (!state.hu) return { fans: [], total: 0, dealer: state.dealer, winner: null };
+  if (!state.hu) return { fans: [], totalPoints: 0, dealer: state.dealer, winner: null };
   const winner = state.hu.winner;
   const hand = state.hands[winner];
   const melds = state.melds[winner];
+  const flowers = state.flowers[winner];
   const selfDraw = state.hu.selfDraw;
-  const decomp = decomposeHand(hand, melds);
+  const goldenKey = state.goldenKey;
+  const decomp = decomposeHand(hand, melds, goldenKey);
+
   const fans = [];
+  const base = cfg.basePoints;
 
-  // Gather all sets (melds + concealed sets)
-  const allSets = [];
-  // Concealed pair:
-  if (decomp.ok) {
-    for (const s of decomp.concealedSets) {
-      const suit = s.key[0];
-      const n = parseInt(s.key.slice(1));
-      const tiles = s.type === 'pung'
-        ? [{ suit, n: isNaN(n) ? s.key.slice(1) : n }, { suit, n: isNaN(n) ? s.key.slice(1) : n }, { suit, n: isNaN(n) ? s.key.slice(1) : n }]
-        : [{ suit, n }, { suit, n: n + 1 }, { suit, n: n + 2 }];
-      allSets.push({ type: s.type, tiles, exposed: false });
-    }
-  }
+  // --- Flower points ---
+  const flowerCount = flowers.length;
+  const flowerPts = flowerCount * cfg.flowerPerTile;
+
+  // --- Gold count (all golds in concealed hand; exposed melds never contain gold) ---
+  let goldCount = 0;
+  for (const t of hand) if (goldenKey && tileKey(t) === goldenKey) goldCount++;
+  const goldPts = goldCount * cfg.goldPerTile;
+
+  // --- Dealer continuation ---
+  const dealerCont = (winner === state.dealer) ? (state.dealerStreak || 0) * cfg.dealerContinuationPerHand : 0;
+
+  // --- Kong points ---
+  let kongPts = 0;
   for (const m of melds) {
-    allSets.push({
-      type: m.type === 'kong' ? 'pung' : m.type, // kongs count like pungs for pattern detection
-      tiles: m.tiles,
-      exposed: !m.concealed,
-      isKong: m.type === 'kong',
-    });
+    if (m.type === 'kong') kongPts += m.concealed ? cfg.concealedKong : cfg.openKong;
   }
 
-  const pair = decomp.pair;
+  // --- Special hands ---
+  let special = 0;
+  const addSpecial = (name, value) => { if (value > 0) { special += value; fans.push({ name, value, special: true }); } };
 
-  // All tiles combined
-  const allTiles = [...hand, ...melds.flatMap((m) => m.tiles)];
+  // Blessing / Robbing — mutually exclusive
+  if (state.hu.blessing === 'heaven') addSpecial('天胡 Blessing of Heaven', cfg.blessingOfHeaven);
+  else if (state.hu.blessing === 'earth') addSpecial('地胡 Blessing of Earth', cfg.blessingOfEarth);
+  else if (state.hu.robbingGold) addSpecial('抢金 Robbing the Gold', cfg.robbingTheGold);
 
-  // --- Pattern detection ---
-  const suits = new Set(allTiles.map((t) => t.suit));
-  const hasHonors = suits.has('w') || suits.has('d');
-  const onlyNum = [...suits].filter((s) => ['m', 'p', 's'].includes(s));
-
-  // Clean hand: only one suit, no honors
-  if (onlyNum.length === 1 && !hasHonors) {
-    fans.push({ name: '清一色', value: cfg.cleanHand });
-  } else if (onlyNum.length === 1 && hasHonors) {
-    fans.push({ name: '混一色', value: cfg.mixedOneSuit });
-  }
-
-  // All pungs (no chows)
-  if (allSets.length > 0 && allSets.every((s) => s.type === 'pung')) {
-    fans.push({ name: '碰碰胡', value: cfg.allPungs });
-  }
-
-  // All honors
-  if (allTiles.every((t) => t.suit === 'w' || t.suit === 'd')) {
-    fans.push({ name: '字一色', value: cfg.allHonors });
-  }
-
-  // All terminals (1/9 only, no honors, no chows except 1-2-3 or 7-8-9? — strictly only terminal tiles)
-  const isTerminal = (t) => (['m','p','s'].includes(t.suit) && (t.n === 1 || t.n === 9));
-  if (allTiles.length > 0 && allTiles.every(isTerminal)) {
-    fans.push({ name: '清幺九', value: cfg.pureTerminals });
-  } else if (allTiles.every((t) => isTerminal(t) || t.suit === 'w' || t.suit === 'd')) {
-    fans.push({ name: '幺九', value: cfg.allTerminals });
-  }
-
-  // Dragon pungs
-  let dragonPungs = 0;
-  let dragonPairs = 0;
-  for (const s of allSets) {
-    if (s.type === 'pung' && s.tiles[0].suit === 'd') dragonPungs++;
-  }
-  if (pair && pair.key[0] === 'd') dragonPairs++;
-  if (dragonPungs === 3) fans.push({ name: '大三元', value: cfg.bigThreeDragons });
-  else if (dragonPungs === 2 && dragonPairs === 1) fans.push({ name: '小三元', value: cfg.smallThreeDragons });
-  else if (dragonPungs > 0) fans.push({ name: `箭刻 ×${dragonPungs}`, value: cfg.dragonTriplet * dragonPungs });
-
-  // Wind pungs
-  let windPungs = 0;
-  let windPairs = 0;
-  const seatWind = state.seatWinds[winner];
-  const roundWind = state.roundWind;
-  for (const s of allSets) {
-    if (s.type === 'pung' && s.tiles[0].suit === 'w') {
-      windPungs++;
-      if (s.tiles[0].n === seatWind) fans.push({ name: '门风刻', value: cfg.seatWindPung });
-      if (s.tiles[0].n === roundWind) fans.push({ name: '圈风刻', value: cfg.roundWindPung });
-    }
-  }
-  if (pair && pair.key[0] === 'w') windPairs++;
-  if (windPungs === 4) fans.push({ name: '大四喜', value: cfg.bigFourWinds });
-  else if (windPungs === 3 && windPairs === 1) fans.push({ name: '小四喜', value: cfg.smallFourWinds });
-
-  // Seven pairs
-  if (melds.length === 0 && hand.length === 14) {
-    const counts = {};
-    for (const t of hand) counts[tileKey(t)] = (counts[tileKey(t)] || 0) + 1;
-    if (Object.values(counts).every((v) => v === 2 || v === 4)) {
-      fans.push({ name: '七对', value: cfg.sevenPairs });
+  // All Sequences (平胡) — no pungs or kongs anywhere
+  if (decomp.ok) {
+    const allPungLike = [
+      ...decomp.concealedSets.map((s) => s.type),
+      ...melds.map((m) => m.type === 'chow' ? 'chow' : 'pung'),
+    ];
+    if (allPungLike.length > 0 && allPungLike.every((t) => t === 'chow')) {
+      addSpecial('平胡 All Sequences', cfg.allSequences);
     }
   }
 
-  // Concealed / 门清
-  const anyExposed = melds.some((m) => !m.concealed);
-  if (!anyExposed && selfDraw) fans.push({ name: '门清自摸', value: cfg.concealed + cfg.selfDraw });
-  else if (!anyExposed) fans.push({ name: '门清', value: cfg.concealed });
-  else if (selfDraw) fans.push({ name: '自摸', value: cfg.selfDraw });
+  // One Flower
+  if (flowerCount === 1) addSpecial('只有一张花 One Flower', cfg.oneFlower);
 
-  // Last tile (海底)
-  if (state.wall.length === 0 && selfDraw) fans.push({ name: '海底捞月', value: cfg.lastTile });
-
-  // Kong bonus (杠上开花)
-  if (state.lastDrawn && state.lastDrawn.afterKong && selfDraw) {
-    fans.push({ name: '杠上开花', value: cfg.kongBonus });
+  // Golden Pair / Golden Dragon / Three Gold Knockdown (mutually exclusive at 3 golds)
+  if (decomp.ok && decomp.pair && decomp.pair.wilds === 2 && goldCount === 2) {
+    addSpecial('金雀 Golden Pair', cfg.goldenPair);
+  } else if (goldCount >= 3) {
+    let asTriplet = false;
+    if (decomp.ok) {
+      for (const s of decomp.concealedSets) {
+        if (s.type === 'pung' && s.wilds === 3) { asTriplet = true; break; }
+      }
+    }
+    if (asTriplet) addSpecial('金龙 Golden Dragon', cfg.goldenDragon);
+    else addSpecial('三金倒 Three Gold Knockdown', cfg.threeGoldKnockdown);
   }
 
-  // At least 起胡 — require minimum 1 fan
-  const raw = fans.reduce((a, f) => a + f.value, 0);
-  const totalFans = Math.min(raw, cfg.limitFans);
-  const totalPoints = totalFans * cfg.basePoints;
+  // Full Bloom: all 4 flowers of same category (flowers-f or seasons-z) OR 4-of-a-kind of same wind/dragon.
+  const fCount = flowers.filter((t) => t.suit === 'f').length;
+  const zCount = flowers.filter((t) => t.suit === 'z').length;
+  let fullBlooms = 0;
+  if (fCount === 4) fullBlooms++;
+  if (zCount === 4) fullBlooms++;
+  // 4-of-a-kind honors across hand + melds
+  const honorCounts = {};
+  for (const t of hand) if (t.suit === 'w' || t.suit === 'd') honorCounts[tileKey(t)] = (honorCounts[tileKey(t)] || 0) + 1;
+  for (const m of melds) for (const t of m.tiles) if (t.suit === 'w' || t.suit === 'd') honorCounts[tileKey(t)] = (honorCounts[tileKey(t)] || 0) + 1;
+  for (const c of Object.values(honorCounts)) if (c >= 4) fullBlooms++;
+  for (let i = 0; i < fullBlooms; i++) addSpecial('花大开 Full Bloom', cfg.fullBloom);
+
+  // --- Formula ---
+  const multiplierSum = base + flowerPts + goldPts + dealerCont + kongPts;
+  const multiplied = multiplierSum * 2;
+  const totalPoints = multiplied + special;
+
+  // Summary fans shown in UI (base + components first, then specials)
+  const breakdown = [
+    { name: '基础 Base', value: base },
+    ...(flowerPts ? [{ name: `花 Flowers ×${flowerCount}`, value: flowerPts }] : []),
+    ...(goldPts ? [{ name: `金 Gold ×${goldCount}`, value: goldPts }] : []),
+    ...(dealerCont ? [{ name: `连庄 Dealer Cont. ×${state.dealerStreak}`, value: dealerCont }] : []),
+    ...(kongPts ? [{ name: `杠 Kong`, value: kongPts }] : []),
+  ];
 
   return {
-    fans,
-    totalFans,
-    totalPoints,
+    fans: [...breakdown, ...fans],
+    breakdown,
+    specials: fans,
+    base, flowerPts, goldPts, dealerCont, kongPts,
+    multiplierSum, multiplied, special,
+    totalFans: totalPoints, totalPoints,
     dealer: state.dealer,
     winner,
     from: state.hu.from,
@@ -161,26 +130,21 @@ function scoreHand(state, cfg = DEFAULT_SCORING) {
   };
 }
 
-// Payment calculation: returns { deltas: [p0,p1,p2,p3] }
+// Payment: self-draw = everyone pays winner; discard-pay = only discarder pays.
 function paymentDeltas(result, state) {
   const deltas = [0, 0, 0, 0];
-  if (!result.winner && result.winner !== 0) return { deltas };
+  if (!result || result.winner == null) return { deltas };
+  const pts = result.totalPoints;
   const winner = result.winner;
-  const points = result.totalPoints;
-  const dealerBonus = (winner === state.dealer || result.from === state.dealer) ? 2 : 1;
   if (result.selfDraw) {
-    // Everyone pays winner
     for (let i = 0; i < 4; i++) {
       if (i === winner) continue;
-      const pay = points * (i === state.dealer || winner === state.dealer ? 2 : 1);
-      deltas[i] -= pay;
-      deltas[winner] += pay;
+      deltas[i] -= pts;
+      deltas[winner] += pts;
     }
   } else {
-    // Only discarder pays, but 2x if dealer involved
-    const pay = points * dealerBonus;
-    deltas[result.from] -= pay;
-    deltas[winner] += pay;
+    deltas[result.from] -= pts;
+    deltas[winner] += pts;
   }
   return { deltas };
 }
