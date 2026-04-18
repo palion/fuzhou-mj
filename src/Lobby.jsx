@@ -1,4 +1,14 @@
 // Lobby UI — create/join online rooms via shareable URL, or solo vs AI.
+function useLobbyResponsive() {
+  const [w, setW] = React.useState(() => typeof window === 'undefined' ? 1200 : window.innerWidth);
+  React.useEffect(() => {
+    const onResize = () => setW(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  return { w, isPhone: w < 640 };
+}
+
 function Lobby({ tweaks, onStart }) {
   const urlRoom = getRoomFromHash();
   const [mode, setMode] = React.useState(urlRoom ? 'join' : 'menu');
@@ -9,6 +19,7 @@ function Lobby({ tweaks, onStart }) {
     { name: 'AI · 西', kind: 'ai', personality: 'defensive' },
     { name: 'AI · 北', kind: 'ai', personality: 'aggressive' },
   ]);
+  const rs = useLobbyResponsive();
 
   React.useEffect(() => { localStorage.setItem('mj_name', playerName); }, [playerName]);
   React.useEffect(() => {
@@ -20,14 +31,14 @@ function Lobby({ tweaks, onStart }) {
   const startSolo = () => onStart({ seats, networking: null });
 
   return (
-    <div style={lobbyStyles.wrap}>
-      <div style={lobbyStyles.card}>
+    <div style={lobbyStyles.wrap(rs)}>
+      <div style={lobbyStyles.card(rs)}>
         <div style={lobbyStyles.brandRow}>
           <div style={lobbyStyles.logoTile}>
             <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 30, color: '#1a5b2e', fontWeight: 700 }}>發</span>
           </div>
           <div>
-            <div style={lobbyStyles.brand}>福州麻將</div>
+            <div style={lobbyStyles.brand(rs)}>福州麻將</div>
             <div style={lobbyStyles.sub}>Fuzhou Mahjong · 十六番</div>
           </div>
         </div>
@@ -39,7 +50,7 @@ function Lobby({ tweaks, onStart }) {
               <input style={lobbyStyles.input} value={playerName} onChange={(e) => setPlayerName(e.target.value)} />
             </label>
             <div style={lobbyStyles.sectionTitle}>Play</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: rs.isPhone ? '1fr' : '1fr 1fr', gap: 12 }}>
               <button style={lobbyStyles.bigBtn} onClick={() => setMode('solo')}>
                 <div style={lobbyStyles.btnTitle}>Solo</div>
                 <div style={lobbyStyles.btnSub}>vs 3 AI</div>
@@ -141,21 +152,43 @@ function HostFlow({ playerName, setPlayerName, seats, setSeats, updateSeat, onBa
   const [inviteUrlStr, setInviteUrlStr] = React.useState('');
   const netRef = React.useRef(null);
   const seatsRef = React.useRef(seats);
-  const peerToSeat = React.useRef(new Map()); // peerId -> seatIdx
+  const peerToSeat = React.useRef(new Map());         // peerId -> seatIdx (current connection only)
+  const clientIdToSeat = React.useRef(new Map());     // clientId -> seatIdx (durable across reconnects)
   React.useEffect(() => { seatsRef.current = seats; }, [seats]);
 
-  const assignSeat = (peerId, name) => {
-    const idx = seatsRef.current.findIndex((s) => s.kind === 'ai');
+  const assignSeat = (peerId, clientId, name) => {
+    // Reconnect path: known clientId maps to a seat — rebind if still unoccupied or flagged for us.
+    if (clientId && clientIdToSeat.current.has(clientId)) {
+      const idx = clientIdToSeat.current.get(clientId);
+      const existing = seatsRef.current[idx];
+      const reclaimable = existing && (existing.kind === 'ai' || existing.disconnected || existing.clientId === clientId);
+      if (reclaimable) {
+        peerToSeat.current.set(peerId, idx);
+        const next = seatsRef.current.map((s, i) =>
+          i === idx ? { name: name || s.name, kind: 'human', self: false, peerId, clientId, disconnected: false } : s
+        );
+        seatsRef.current = next;
+        setSeats(next);
+        return { idx, seats: next, resumed: true };
+      }
+      // Stale mapping — drop it and fall through to fresh assignment.
+      clientIdToSeat.current.delete(clientId);
+    }
+    const idx = seatsRef.current.findIndex((s) => s.kind === 'ai' || s.disconnected);
     if (idx < 0) return { idx: -1, seats: seatsRef.current };
     peerToSeat.current.set(peerId, idx);
+    if (clientId) clientIdToSeat.current.set(clientId, idx);
     const next = [...seatsRef.current];
-    next[idx] = { name: name || 'Friend', kind: 'human', self: false, peerId };
+    next[idx] = { name: name || 'Friend', kind: 'human', self: false, peerId, clientId, disconnected: false };
     seatsRef.current = next;
     setSeats(next);
-    return { idx, seats: next };
+    return { idx, seats: next, resumed: false };
   };
 
-  const releaseSeat = (peerId) => {
+  // During lobby: disconnect frees the seat back to AI but keeps the clientId mapping so a prompt
+  // reconnect can reclaim the same seat. During game: GameTable installs its own onDisconnect that
+  // marks the seat disconnected instead.
+  const releaseSeatInLobby = (peerId) => {
     const idx = peerToSeat.current.get(peerId);
     if (idx == null) return seatsRef.current;
     peerToSeat.current.delete(peerId);
@@ -178,14 +211,14 @@ function HostFlow({ playerName, setPlayerName, seats, setSeats, updateSeat, onBa
           onConnect: () => { /* wait for hello before assigning seat */ },
           onMessage: (peerId, msg) => {
             if (msg && msg.type === 'hello') {
-              const { idx, seats: next } = assignSeat(peerId, msg.name);
+              const { idx, seats: next, resumed } = assignSeat(peerId, msg.clientId, msg.name);
               if (idx < 0) return;
-              netRef.current && netRef.current.sendTo(peerId, { type: 'welcome', mySeatIdx: idx, seats: next });
+              netRef.current && netRef.current.sendTo(peerId, { type: 'welcome', mySeatIdx: idx, seats: next, resume: resumed });
               netRef.current && netRef.current.broadcast({ type: 'lobbyState', seats: next });
             }
           },
           onDisconnect: (peerId) => {
-            const next = releaseSeat(peerId);
+            const next = releaseSeatInLobby(peerId);
             netRef.current && netRef.current.broadcast({ type: 'lobbyState', seats: next });
           },
           onError: (e) => console.warn('[net]', e),
@@ -215,7 +248,10 @@ function HostFlow({ playerName, setPlayerName, seats, setSeats, updateSeat, onBa
         net.sendTo(peerId, { type: 'start', mySeatIdx: seatIdx, seats: s, seed, initialState });
       }
     }
-    onStart({ seats: s, networking: net ? { ...net, mySeatIdx: 0, seed, initialState } : null });
+    const networking = net
+      ? { ...net, mySeatIdx: 0, seed, initialState, clientIdToSeat: clientIdToSeat.current }
+      : null;
+    onStart({ seats: s, networking });
   };
 
   const copyUrl = async () => {
@@ -280,6 +316,8 @@ function JoinFlow({ initialRoom, playerName, setPlayerName, onBack, onStart }) {
   const netRef = React.useRef(null);
   const startedRef = React.useRef(false);
 
+  const clientId = React.useMemo(() => getClientId(), []);
+
   const tryConnect = async (rid) => {
     setStatus('connecting');
     setErrorMsg('');
@@ -291,7 +329,7 @@ function JoinFlow({ initialRoom, playerName, setPlayerName, onBack, onStart }) {
           if (msg.type === 'welcome') {
             setMySeatIdx(msg.mySeatIdx);
             setLobbySeats(msg.seats);
-            setStatus('waiting');
+            if (!startedRef.current) setStatus('waiting');
           } else if (msg.type === 'lobbyState') {
             setLobbySeats(msg.seats);
           } else if (msg.type === 'start') {
@@ -304,15 +342,23 @@ function JoinFlow({ initialRoom, playerName, setPlayerName, onBack, onStart }) {
                 mySeatIdx: msg.mySeatIdx,
                 seed: msg.seed,
                 initialState: msg.initialState,
+                clientId,
               },
             });
           }
         },
-        onClose: () => { if (!startedRef.current) { setStatus('error'); setErrorMsg('Lost connection to host.'); } },
+        onClose: () => {
+          // Don't flip to 'error' — joinRoom will attempt silent reconnect. Just show a notice pre-match.
+          if (!startedRef.current) setStatus('reconnecting');
+        },
+        onReconnect: () => {
+          // Data channel re-opened — re-send hello so host can rebind us to the same seat.
+          try { netRef.current.send({ type: 'hello', clientId, name: playerName }); } catch {}
+        },
         onError: (e) => console.warn('[net]', e),
       });
       netRef.current = net;
-      net.send({ type: 'hello', name: playerName });
+      net.send({ type: 'hello', clientId, name: playerName });
     } catch (e) {
       setStatus('error');
       setErrorMsg(e.message || String(e));
@@ -346,6 +392,7 @@ function JoinFlow({ initialRoom, playerName, setPlayerName, onBack, onStart }) {
         </>
       )}
       {status === 'connecting' && <div style={lobbyStyles.netStatus}>Connecting to host…</div>}
+      {status === 'reconnecting' && <div style={lobbyStyles.netStatus}>Reconnecting to host…</div>}
       {status === 'waiting' && (
         <>
           <div style={lobbyStyles.netStatus}>
@@ -380,21 +427,22 @@ function JoinFlow({ initialRoom, playerName, setPlayerName, onBack, onStart }) {
 }
 
 const lobbyStyles = {
-  wrap: {
+  wrap: (rs) => ({
     position: 'fixed', inset: 0,
     background: 'radial-gradient(ellipse at 30% 20%, #1a3025 0%, #0a130e 60%, #05080a 100%)',
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-    padding: 24, overflow: 'auto', zIndex: 10,
-  },
-  card: {
+    display: 'flex', alignItems: rs && rs.isPhone ? 'flex-start' : 'center', justifyContent: 'center',
+    padding: rs && rs.isPhone ? 12 : 24,
+    overflow: 'auto', zIndex: 10,
+  }),
+  card: (rs) => ({
     width: 'min(560px, 100%)',
     background: 'linear-gradient(180deg, #151c18 0%, #0e1512 100%)',
     border: '1px solid #23302a',
-    borderRadius: 20,
-    padding: 32,
+    borderRadius: rs && rs.isPhone ? 14 : 20,
+    padding: rs && rs.isPhone ? 18 : 32,
     boxShadow: '0 30px 80px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.04)',
     color: '#e8ebe7',
-  },
+  }),
   brandRow: { display: 'flex', alignItems: 'center', gap: 16, marginBottom: 24 },
   logoTile: {
     width: 56, height: 72, borderRadius: 8,
@@ -402,7 +450,7 @@ const lobbyStyles = {
     boxShadow: '0 3px 0 #a89671, 0 6px 14px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,255,255,.8)',
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
-  brand: { fontFamily: "'Noto Serif SC', serif", fontSize: 28, fontWeight: 700, lineHeight: 1, color: '#f0ead6' },
+  brand: (rs) => ({ fontFamily: "'Noto Serif SC', serif", fontSize: rs && rs.isPhone ? 24 : 28, fontWeight: 700, lineHeight: 1, color: '#f0ead6' }),
   sub: { fontFamily: 'Inter, system-ui', fontSize: 13, color: '#8aa699', marginTop: 4, letterSpacing: 0.6 },
   sectionTitle: { fontFamily: 'Inter', fontSize: 11, fontWeight: 600, letterSpacing: 2, color: '#6a8578', textTransform: 'uppercase' },
   label: { display: 'grid', gap: 6 },

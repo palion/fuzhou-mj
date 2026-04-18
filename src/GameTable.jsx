@@ -1,5 +1,26 @@
-// Main table UI — dark charcoal + jade, slight 3D tilt.
+// Main table UI — dark charcoal + jade, slight 3D tilt on desktop.
 // Supports solo (local AI), host (authoritative local engine + broadcast), and client (renders host state + sends actions).
+// Responsive: phone (<640) uses a compact vertical layout; tablet (<960) a mid-density layout; desktop the full 3D felt.
+
+function useResponsive() {
+  const [size, setSize] = React.useState(() => ({
+    w: typeof window === 'undefined' ? 1200 : window.innerWidth,
+    h: typeof window === 'undefined' ? 800 : window.innerHeight,
+  }));
+  React.useEffect(() => {
+    const onResize = () => setSize({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+    };
+  }, []);
+  const isPhone = size.w < 640;
+  const isTablet = size.w >= 640 && size.w < 960;
+  const isLandscape = size.w > size.h;
+  return { w: size.w, h: size.h, isPhone, isTablet, isDesktop: !isPhone && !isTablet, isLandscape };
+}
 
 function parseGoldenKey(key) {
   if (!key) return null;
@@ -13,10 +34,14 @@ function parseGoldenKey(key) {
 
 function priorityOf(c) { return { hu: 4, kong: 3, pong: 3, chi: 1 }[c.type] || 0; }
 
-function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
+function GameTable({ seats: initialSeats, networking, tweaks, onExit, scoringCfg }) {
   const role = networking?.role || 'solo';
   const isClient = role === 'client';
   const myIdx = networking?.mySeatIdx ?? 0;
+  const rs = useResponsive();
+
+  // Seats are local state so disconnect/reconnect can update the visible roster without a re-mount.
+  const [seats, setSeats] = React.useState(initialSeats);
 
   const [state, setState] = React.useState(() => {
     if (networking?.initialState) return networking.initialState;
@@ -35,7 +60,7 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
   const peerToSeatRef = React.useRef(new Map());
   const stateRef = React.useRef(state);
   const seatsRef = React.useRef(seats);
-  const respondedForRef = React.useRef(null); // discard id we've already answered
+  const respondedForRef = React.useRef(null);
 
   React.useEffect(() => { stateRef.current = state; }, [state]);
   React.useEffect(() => { seatsRef.current = seats; }, [seats]);
@@ -54,6 +79,19 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
     if (role === 'host') {
       networking.handlers.onMessage = (peerId, msg) => {
         if (!msg) return;
+        // Reconnect: if a known clientId comes back, remap the peer to its seat and resync.
+        if (msg.type === 'hello' && msg.clientId && networking.clientIdToSeat) {
+          const idx = networking.clientIdToSeat.get(msg.clientId);
+          if (idx != null) {
+            peerToSeatRef.current.set(peerId, idx);
+            const nextSeats = seatsRef.current.map((s, i) => i === idx ? { ...s, peerId, disconnected: false } : s);
+            setSeats(nextSeats);
+            networking.sendTo(peerId, { type: 'welcome', mySeatIdx: idx, seats: nextSeats, resume: true });
+            networking.sendTo(peerId, { type: 'state', state: stateRef.current, round, hand, scores });
+            pushLog(`${nextSeats[idx].name} 重連`);
+          }
+          return;
+        }
         const seatIdx = peerToSeatRef.current.get(peerId);
         if (seatIdx == null) return;
         const s = stateRef.current;
@@ -74,6 +112,14 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
           setState((st) => declareHu(st, seatIdx));
         }
       };
+      networking.handlers.onDisconnect = (peerId) => {
+        const seatIdx = peerToSeatRef.current.get(peerId);
+        if (seatIdx == null) return;
+        peerToSeatRef.current.delete(peerId);
+        const nextSeats = seatsRef.current.map((s, i) => i === seatIdx ? { ...s, disconnected: true } : s);
+        setSeats(nextSeats);
+        pushLog(`${nextSeats[seatIdx].name} 離線`);
+      };
     } else if (role === 'client') {
       networking.handlers.onMessage = (msg) => {
         if (!msg) return;
@@ -82,6 +128,9 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
           if (msg.round != null) setRound(msg.round);
           if (msg.hand != null) setHand(msg.hand);
           if (msg.scores) setScores(msg.scores);
+        } else if (msg.type === 'welcome') {
+          // Resume after reconnect — host re-sent seat assignment.
+          // Seats may have shifted if others disconnected; nothing else to do here.
         } else if (msg.type === 'score') {
           setShowScore(msg.payload);
         } else if (msg.type === 'next-hand') {
@@ -91,8 +140,18 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
           onExit();
         }
       };
+      networking.handlers.onReconnect = () => {
+        // Data channel reopened mid-game — re-send hello so host can rebind us to our seat.
+        try { networking.send({ type: 'hello', clientId: networking.clientId, name: seats[myIdx]?.name }); } catch {}
+      };
     }
-    return () => { if (networking?.handlers) networking.handlers.onMessage = null; };
+    return () => {
+      if (networking?.handlers) {
+        networking.handlers.onMessage = null;
+        networking.handlers.onDisconnect = null;
+        networking.handlers.onReconnect = null;
+      }
+    };
   }, [networking, role]);
 
   // Host: broadcast state on every change
@@ -127,7 +186,8 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
     if (state.phase === 'discard') {
       const p = state.turn;
       const seat = seats[p];
-      if (seat.kind === 'human') {
+      // Disconnected humans fall back to AI autoplay.
+      if (seat.kind === 'human' && !seat.disconnected) {
         if (p === myIdx) setHuBtnReady(canDeclareHu(state, myIdx));
         else setHuBtnReady(false);
         return;
@@ -174,7 +234,8 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
       const opts = allClaims.filter((c) => c.player === p);
       if (opts.length === 0) { decisions.set(p, null); continue; }
       const seat = seats[p];
-      if (seat.kind === 'ai') {
+      // Disconnected humans: AI decides for them.
+      if (seat.kind === 'ai' || seat.disconnected) {
         const pers = AI_PERSONALITIES[seat.personality] || AI_PERSONALITIES.balanced;
         const choice = decideClaim(opts, state, pers);
         decisions.set(p, choice || null);
@@ -337,7 +398,7 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
   };
 
   return (
-    <div style={tableStyles.root(tweaks)}>
+    <div style={tableStyles.root(tweaks, rs)}>
       <TableChrome
         round={round} hand={hand} roundWind={state.roundWind}
         wallRemaining={state.wall.length}
@@ -345,14 +406,15 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
         scores={scores} seats={seats} turn={state.turn}
         onExit={onExit}
         networking={networking}
+        rs={rs}
       />
-      <div style={tableStyles.tableWrap}>
-        <div style={tableStyles.felt(tweaks)}>
+      <div style={tableStyles.tableWrap(rs)}>
+        <div style={tableStyles.felt(tweaks, rs)}>
           {[0, 1, 2, 3].filter((i) => i !== myIdx).map((i) => (
             <OpponentSeat key={i} seat={seats[i]} idx={i}
-              position={positionOfSeat(i)} state={state} tweaks={tweaks} />
+              position={positionOfSeat(i)} state={state} tweaks={tweaks} rs={rs} />
           ))}
-          <CenterPond state={state} tweaks={tweaks} myIdx={myIdx} />
+          <CenterPond state={state} tweaks={tweaks} myIdx={myIdx} rs={rs} />
           <MySeat
             seat={seats[myIdx]} state={state} tweaks={tweaks} myIdx={myIdx}
             isMyTurn={isMyTurn}
@@ -363,66 +425,76 @@ function GameTable({ seats, networking, tweaks, onExit, scoringCfg }) {
             onDiscard={doDiscard}
             onSelfKong={doSelfKong}
             onHu={doHu}
+            rs={rs}
           />
         </div>
       </div>
 
       {pendingClaims && (
         <ClaimPrompt options={pendingClaims.options} tile={pendingClaims.tile}
-          onChoose={takeMyClaim} onPass={passClaim} />
+          onChoose={takeMyClaim} onPass={passClaim} rs={rs} />
       )}
 
-      <EventLog log={log} />
+      {!rs.isPhone && <EventLog log={log} rs={rs} />}
 
       {showScore && (
         showScore.matchOver
-          ? <MatchOver scores={showScore.scores} seats={seats} onExit={onExit} />
-          : <ScoreModal payload={showScore} seats={seats} onNext={startNextHand} hideNext={isClient} />
+          ? <MatchOver scores={showScore.scores} seats={seats} onExit={onExit} rs={rs} />
+          : <ScoreModal payload={showScore} seats={seats} onNext={startNextHand} hideNext={isClient} rs={rs} />
       )}
     </div>
   );
 }
 
-function TableChrome({ round, hand, roundWind, wallRemaining, goldenKey, scores, seats, turn, onExit, networking }) {
+function TableChrome({ round, hand, roundWind, wallRemaining, goldenKey, scores, seats, turn, onExit, networking, rs }) {
   const windCh = { E: '東', S: '南', W: '西', N: '北' }[roundWind];
   const goldenTile = goldenKey ? parseGoldenKey(goldenKey) : null;
   const friends = networking?.role === 'host' ? (networking.connections ? networking.connections.size : 0) : null;
+  const scoreGap = rs.isPhone ? 4 : 10;
+  const badgeMinW = rs.isPhone ? 52 : 90;
   return (
-    <div style={tableStyles.chrome}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
-        <button style={tableStyles.exitBtn} onClick={onExit}>← Exit</button>
-        <div style={tableStyles.matchBadge}>
-          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 20, color: '#e0c97e' }}>{windCh}場</div>
-          <div style={{ fontFamily: 'Inter', fontSize: 10, color: '#8aa699', letterSpacing: 2 }}>ROUND {round}·{hand}</div>
+    <div style={tableStyles.chrome(rs)}>
+      <div style={tableStyles.chromeLeft(rs)}>
+        <button style={tableStyles.exitBtn(rs)} onClick={onExit}>{rs.isPhone ? '←' : '← Exit'}</button>
+        <div style={tableStyles.matchBadge(rs)}>
+          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 15 : 20, color: '#e0c97e' }}>{windCh}場</div>
+          <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 9 : 10, color: '#8aa699', letterSpacing: 2 }}>R{round}·{hand}</div>
         </div>
-        <div style={tableStyles.wallBadge}>
-          <div style={{ fontFamily: 'Inter', fontSize: 11, color: '#8aa699', letterSpacing: 1 }}>WALL</div>
-          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 22, color: '#e8ebe7' }}>{wallRemaining}</div>
+        <div style={tableStyles.wallBadge(rs)}>
+          <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 9 : 11, color: '#8aa699', letterSpacing: 1 }}>WALL</div>
+          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 16 : 22, color: '#e8ebe7' }}>{wallRemaining}</div>
         </div>
         {goldenTile && (
-          <div style={tableStyles.goldenBadge} title={`Golden (wild): ${tileDesc(goldenTile)}`}>
-            <div style={{ fontFamily: 'Inter', fontSize: 10, color: '#c9a14a', letterSpacing: 2 }}>金 GOLDEN</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 4 }}>
+          <div style={tableStyles.goldenBadge(rs)} title={`Golden (wild): ${tileDesc(goldenTile)}`}>
+            {!rs.isPhone && (
+              <div style={{ fontFamily: 'Inter', fontSize: 10, color: '#c9a14a', letterSpacing: 2 }}>金 GOLDEN</div>
+            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: rs.isPhone ? 0 : 4 }}>
               <div style={{ position: 'relative' }}>
                 <Tile tile={goldenTile} size="xs" />
                 <GoldenBadge size={14} />
               </div>
-              <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 13, color: '#e0c97e' }}>{tileDesc(goldenTile)}</span>
+              {!rs.isPhone && (
+                <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 13, color: '#e0c97e' }}>{tileDesc(goldenTile)}</span>
+              )}
             </div>
           </div>
         )}
-        {networking && (
+        {networking && !rs.isPhone && (
           <div style={tableStyles.netPill}>
             <span style={{ color: '#8aa699' }}>{networking.role === 'host' ? 'HOST' : 'CLIENT'}</span>
             {friends != null && <span> · {friends} linked</span>}
           </div>
         )}
       </div>
-      <div style={{ display: 'flex', gap: 10 }}>
+      <div style={{ display: 'flex', gap: scoreGap, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
         {scores.map((v, i) => (
-          <div key={i} style={{ ...tableStyles.scoreBadge, ...(turn === i ? tableStyles.scoreActive : {}) }}>
-            <div style={{ fontFamily: 'Inter', fontSize: 10, color: '#8aa699', letterSpacing: 1 }}>{['東','南','西','北'][i]} · {(seats[i].name || '').slice(0, 10)}</div>
-            <div style={{ fontFamily: 'Inter', fontSize: 18, fontWeight: 700, color: v >= 0 ? '#e8ebe7' : '#e07b6b' }}>{v >= 0 ? '+' : ''}{v}</div>
+          <div key={i} style={{ ...tableStyles.scoreBadge(rs), minWidth: badgeMinW, ...(turn === i ? tableStyles.scoreActive : {}) }}>
+            <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 9 : 10, color: '#8aa699', letterSpacing: 1 }}>
+              {['東','南','西','北'][i]} {!rs.isPhone && `· ${(seats[i].name || '').slice(0, 10)}`}
+              {seats[i].disconnected && <span style={{ color: '#e07b6b' }}> ✕</span>}
+            </div>
+            <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 14 : 18, fontWeight: 700, color: v >= 0 ? '#e8ebe7' : '#e07b6b' }}>{v >= 0 ? '+' : ''}{v}</div>
           </div>
         ))}
       </div>
@@ -430,12 +502,31 @@ function TableChrome({ round, hand, roundWind, wallRemaining, goldenKey, scores,
   );
 }
 
-function OpponentSeat({ seat, idx, position, state, tweaks }) {
+function OpponentSeat({ seat, idx, position, state, tweaks, rs }) {
   const hand = state.hands[idx];
   const melds = state.melds[idx];
   const oppFlowers = state.flowers ? state.flowers[idx] : [];
   const isTurn = state.turn === idx;
-  const size = tweaks.density === 'compact' ? 'xs' : 'sm';
+
+  if (rs.isPhone) {
+    return (
+      <div style={tableStyles.opponentPill(position, isTurn)}>
+        <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 14, color: '#e0c97e' }}>{['東','南','西','北'][idx]}</span>
+        <span style={{ fontFamily: 'Inter', fontSize: 11, color: isTurn ? '#fff' : '#8aa699', fontWeight: isTurn ? 600 : 400, maxWidth: 70, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{seat.name}</span>
+        {seat.disconnected && <span style={{ fontSize: 10, color: '#e07b6b' }}>✕</span>}
+        {isTurn && <span style={tableStyles.turnDot} />}
+        <span style={{ fontFamily: 'Inter', fontSize: 10, color: '#8aa699' }}>🀫×{hand.length}</span>
+        {melds.length > 0 && (
+          <div style={{ display: 'flex', gap: 2 }}>
+            {melds.map((m, mi) => <MeldGroup key={mi} meld={m} size="xs" rotate={0} />)}
+          </div>
+        )}
+        {oppFlowers.length > 0 && <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 10, color: '#b0302b' }}>花·{oppFlowers.length}</span>}
+      </div>
+    );
+  }
+
+  const size = rs.isTablet ? 'xs' : (tweaks.density === 'compact' ? 'xs' : 'sm');
   const rotate = position === 'top' ? 180 : position === 'right' ? -90 : 90;
   const handStyle = {
     display: 'flex',
@@ -443,7 +534,7 @@ function OpponentSeat({ seat, idx, position, state, tweaks }) {
     gap: 2, justifyContent: 'center', alignItems: 'center',
   };
   return (
-    <div style={tableStyles.opponentBlock(position)}>
+    <div style={tableStyles.opponentBlock(position, rs)}>
       <div style={tableStyles.opponentLabel(position, isTurn)}>
         <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 18, color: '#e0c97e' }}>
           {['東','南','西','北'][idx]}
@@ -451,6 +542,7 @@ function OpponentSeat({ seat, idx, position, state, tweaks }) {
         <span style={{ fontFamily: 'Inter', fontSize: 12, color: isTurn ? '#fff' : '#8aa699', fontWeight: isTurn ? 600 : 400 }}>
           {seat.name}
         </span>
+        {seat.disconnected && <span style={{ fontSize: 10, color: '#e07b6b' }}>✕ offline</span>}
         {isTurn && <span style={tableStyles.turnDot} />}
         {oppFlowers.length > 0 && <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 11, color: '#b0302b' }}>花·{oppFlowers.length}</span>}
       </div>
@@ -484,20 +576,21 @@ function MeldGroup({ meld, size, rotate }) {
   );
 }
 
-function CenterPond({ state, tweaks, myIdx }) {
+function CenterPond({ state, tweaks, myIdx, rs }) {
   const areaFor = (p) => ['bot', 'right', 'top', 'left'][(p - myIdx + 4) % 4];
   const rotFor = (p) => {
     const rel = (p - myIdx + 4) % 4;
     return ['', 'rotate(-90deg)', 'rotate(180deg)', 'rotate(90deg)'][rel];
   };
+  const maxW = rs.isPhone ? 120 : rs.isTablet ? 180 : 240;
   return (
-    <div style={tableStyles.pond}>
+    <div style={tableStyles.pond(rs)}>
       {[0, 1, 2, 3].map((p) => (
         <div key={p} style={{
           gridArea: areaFor(p),
           display: 'flex', justifyContent: 'center', alignItems: 'center',
         }}>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, maxWidth: 240, justifyContent: 'center', transform: rotFor(p) }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 2, maxWidth: maxW, justifyContent: 'center', transform: rotFor(p) }}>
             {state.discards[p].map((t) => (
               <Tile key={t.id} tile={t} size="xs"
                 glow={state.lastDiscard && state.lastDiscard.tile.id === t.id ? 'rgba(224,201,126,.9)' : null}
@@ -506,41 +599,45 @@ function CenterPond({ state, tweaks, myIdx }) {
           </div>
         </div>
       ))}
-      <div style={tableStyles.centerDisc}>
-        <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 18, color: '#c1a96d', opacity: 0.6 }}>福州</div>
-        <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 14, color: '#c1a96d', opacity: 0.5, letterSpacing: 4 }}>麻將</div>
-      </div>
+      {!rs.isPhone && (
+        <div style={tableStyles.centerDisc(rs)}>
+          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isTablet ? 14 : 18, color: '#c1a96d', opacity: 0.6 }}>福州</div>
+          <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isTablet ? 11 : 14, color: '#c1a96d', opacity: 0.5, letterSpacing: 4 }}>麻將</div>
+        </div>
+      )}
     </div>
   );
 }
 
-function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, selectedTileId, setSelectedTileId, onDiscard, onSelfKong, onHu }) {
+function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, selectedTileId, setSelectedTileId, onDiscard, onSelfKong, onHu, rs }) {
   const hand = sortTiles(state.hands[myIdx]);
   const melds = state.melds[myIdx];
   const myFlowers = state.flowers ? state.flowers[myIdx] : [];
   const drawn = state.lastDrawn && state.lastDrawn.player === myIdx ? state.lastDrawn.tile : null;
   const sorted = drawn ? sortTiles(hand.filter((t) => t.id !== drawn.id)) : hand;
   const goldenKey = state.goldenKey;
+  const tileSize = rs.isPhone ? 'md' : 'lg';
+  const meldSize = rs.isPhone ? 'xs' : 'sm';
 
   return (
-    <div style={tableStyles.mySeat}>
+    <div style={tableStyles.mySeat(rs)}>
       {myFlowers.length > 0 && (
         <div style={tableStyles.flowersRow}>
           <span style={{ fontFamily: 'Inter', fontSize: 10, color: '#8aa699', letterSpacing: 2, marginRight: 4 }}>花 +{myFlowers.length}</span>
           {myFlowers.map((f) => <Tile key={f.id} tile={f} size="xs" />)}
         </div>
       )}
-      <div style={tableStyles.myHand}>
+      <div style={tableStyles.myHand(rs)}>
         {melds.length > 0 && (
-          <div style={{ display: 'flex', gap: 6, alignItems: 'flex-end', marginRight: 10, paddingBottom: 4, opacity: 0.9, borderRight: '1px solid rgba(255,255,255,.08)', paddingRight: 12 }}>
-            {melds.map((m, i) => <MeldGroup key={i} meld={m} size="sm" />)}
+          <div style={{ display: 'flex', gap: rs.isPhone ? 3 : 6, alignItems: 'flex-end', marginRight: rs.isPhone ? 4 : 10, paddingBottom: 4, opacity: 0.9, borderRight: '1px solid rgba(255,255,255,.08)', paddingRight: rs.isPhone ? 6 : 12, flexShrink: 0 }}>
+            {melds.map((m, i) => <MeldGroup key={i} meld={m} size={meldSize} />)}
           </div>
         )}
         {sorted.map((t) => {
           const gold = goldenKey && tileKey(t) === goldenKey;
           return (
-            <div key={t.id} style={{ position: 'relative' }}>
-              <Tile tile={t} size="lg" tilt
+            <div key={t.id} style={{ position: 'relative', flexShrink: 0 }}>
+              <Tile tile={t} size={tileSize} tilt={!rs.isPhone}
                 selected={selectedTileId === t.id}
                 glow={selectedTileId === t.id ? 'rgba(224,201,126,.95)' : (gold ? 'rgba(224,201,126,.55)' : null)}
                 onClick={isMyTurn ? () => {
@@ -548,15 +645,15 @@ function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, sele
                   else setSelectedTileId(t.id);
                 } : null}
                 dim={!isMyTurn} />
-              {gold && <GoldenBadge size={18} />}
+              {gold && <GoldenBadge size={rs.isPhone ? 14 : 18} />}
             </div>
           );
         })}
         {drawn && (
           <>
-            <div style={{ width: 12 }} />
-            <div style={{ position: 'relative' }}>
-              <Tile tile={drawn} size="lg" tilt
+            <div style={{ width: rs.isPhone ? 6 : 12, flexShrink: 0 }} />
+            <div style={{ position: 'relative', flexShrink: 0 }}>
+              <Tile tile={drawn} size={tileSize} tilt={!rs.isPhone}
                 selected={selectedTileId === drawn.id}
                 glow={'rgba(224,201,126,.95)'}
                 onClick={isMyTurn ? () => {
@@ -564,47 +661,47 @@ function MySeat({ seat, state, tweaks, myIdx, isMyTurn, canHu, canSelfKong, sele
                   else setSelectedTileId(drawn.id);
                 } : null}
                 dim={!isMyTurn} />
-              {goldenKey && tileKey(drawn) === goldenKey && <GoldenBadge size={18} />}
+              {goldenKey && tileKey(drawn) === goldenKey && <GoldenBadge size={rs.isPhone ? 14 : 18} />}
             </div>
           </>
         )}
       </div>
-      <div style={tableStyles.actionBar}>
-        {canHu && <button style={{ ...tableStyles.actionBtn, ...tableStyles.huBtn }} onClick={onHu}>胡 HU</button>}
-        {canSelfKong && <button style={tableStyles.actionBtn} onClick={onSelfKong}>杠 KONG</button>}
-        {isMyTurn && selectedTileId && <button style={{ ...tableStyles.actionBtn, ...tableStyles.discardBtn }} onClick={() => onDiscard(selectedTileId)}>Discard</button>}
-        {isMyTurn && !selectedTileId && !canHu && <div style={tableStyles.waitingLbl}>Your turn — tap a tile to select, tap again to discard</div>}
+      <div style={tableStyles.actionBar(rs)}>
+        {canHu && <button style={{ ...tableStyles.actionBtn(rs), ...tableStyles.huBtn }} onClick={onHu}>胡 HU</button>}
+        {canSelfKong && <button style={tableStyles.actionBtn(rs)} onClick={onSelfKong}>杠 KONG</button>}
+        {isMyTurn && selectedTileId && <button style={{ ...tableStyles.actionBtn(rs), ...tableStyles.discardBtn }} onClick={() => onDiscard(selectedTileId)}>Discard</button>}
+        {isMyTurn && !selectedTileId && !canHu && <div style={tableStyles.waitingLbl}>{rs.isPhone ? 'Tap a tile to select, tap again to discard' : 'Your turn — tap a tile to select, tap again to discard'}</div>}
         {!isMyTurn && <div style={tableStyles.waitingLbl}>Waiting for {['東','南','西','北'][state.turn]}…</div>}
       </div>
     </div>
   );
 }
 
-function ClaimPrompt({ options, tile, onChoose, onPass }) {
+function ClaimPrompt({ options, tile, onChoose, onPass, rs }) {
   return (
-    <div style={tableStyles.claimOverlay}>
-      <div style={tableStyles.claimBox}>
+    <div style={tableStyles.claimOverlay(rs)}>
+      <div style={tableStyles.claimBox(rs)}>
         <div style={{ fontFamily: 'Inter', fontSize: 11, color: '#8aa699', letterSpacing: 2 }}>CLAIM</div>
         <div style={{ display: 'flex', gap: 14, alignItems: 'center', margin: '12px 0' }}>
-          <Tile tile={tile} size="md" />
-          <div style={{ fontFamily: 'Inter', fontSize: 14, color: '#e8ebe7' }}>was discarded. Claim it?</div>
+          <Tile tile={tile} size={rs.isPhone ? 'sm' : 'md'} />
+          <div style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 12 : 14, color: '#e8ebe7' }}>was discarded. Claim it?</div>
         </div>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           {options.map((o, i) => {
             const label = { hu: '胡 HU', pong: '碰 PONG', kong: '杠 KONG', chi: '吃 CHI' }[o.type];
             const styleX = o.type === 'hu' ? tableStyles.huBtn : o.type === 'chi' ? {} : tableStyles.discardBtn;
-            return <button key={i} style={{ ...tableStyles.actionBtn, ...styleX }} onClick={() => onChoose(o)}>{label}{o.chow ? ` ${o.chow.join('-')}` : ''}</button>;
+            return <button key={i} style={{ ...tableStyles.actionBtn(rs), ...styleX }} onClick={() => onChoose(o)}>{label}{o.chow ? ` ${o.chow.join('-')}` : ''}</button>;
           })}
-          <button style={tableStyles.actionBtn} onClick={onPass}>Pass</button>
+          <button style={tableStyles.actionBtn(rs)} onClick={onPass}>Pass</button>
         </div>
       </div>
     </div>
   );
 }
 
-function EventLog({ log }) {
+function EventLog({ log, rs }) {
   return (
-    <div style={tableStyles.log}>
+    <div style={tableStyles.log(rs)}>
       {log.slice(-5).map((l, i) => (
         <div key={i} style={{ fontFamily: 'Inter', fontSize: 11, color: '#8aa699', opacity: 0.5 + i * 0.12 }}>{l}</div>
       ))}
@@ -612,15 +709,15 @@ function EventLog({ log }) {
   );
 }
 
-function ScoreModal({ payload, seats, onNext, hideNext }) {
+function ScoreModal({ payload, seats, onNext, hideNext, rs }) {
   const { state, result } = payload;
   return (
     <div style={tableStyles.modalWrap}>
-      <div style={tableStyles.modalCard}>
+      <div style={tableStyles.modalCard(rs)}>
         {result ? (
           <>
             <div style={{ fontFamily: 'Inter', fontSize: 11, color: '#8aa699', letterSpacing: 2 }}>HAND COMPLETE</div>
-            <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 32, color: '#e0c97e', marginTop: 6 }}>
+            <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 24 : 32, color: '#e0c97e', marginTop: 6 }}>
               {seats[result.winner].name} 胡！
             </div>
             <div style={{ fontFamily: 'Inter', fontSize: 13, color: '#8aa699', marginTop: 6 }}>
@@ -629,7 +726,7 @@ function ScoreModal({ payload, seats, onNext, hideNext }) {
             <div style={{ display: 'grid', gap: 8, marginTop: 20 }}>
               {(result.breakdown || []).map((f, i) => (
                 <div key={`b${i}`} style={tableStyles.fanRow}>
-                  <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 15, color: '#c3d3ca' }}>{f.name}</span>
+                  <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 13 : 15, color: '#c3d3ca' }}>{f.name}</span>
                   <span style={{ fontFamily: 'Inter', fontSize: 13, color: '#e0c97e' }}>+{f.value}</span>
                 </div>
               ))}
@@ -641,27 +738,27 @@ function ScoreModal({ payload, seats, onNext, hideNext }) {
               )}
               {(result.specials || []).map((f, i) => (
                 <div key={`s${i}`} style={tableStyles.fanRow}>
-                  <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 15, color: '#e8ebe7' }}>{f.name}</span>
+                  <span style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 13 : 15, color: '#e8ebe7' }}>{f.name}</span>
                   <span style={{ fontFamily: 'Inter', fontSize: 13, color: '#e0c97e', fontWeight: 600 }}>+{f.value}</span>
                 </div>
               ))}
               <div style={{ ...tableStyles.fanRow, borderTop: '1px solid #2a3a30', marginTop: 8, paddingTop: 12 }}>
                 <span style={{ fontFamily: 'Inter', fontSize: 14, color: '#8aa699' }}>Total {result.selfDraw ? 'each opponent pays' : 'discarder pays'}</span>
-                <span style={{ fontFamily: 'Inter', fontSize: 22, color: '#e0c97e', fontWeight: 700 }}>{result.totalPoints} 分</span>
+                <span style={{ fontFamily: 'Inter', fontSize: rs.isPhone ? 18 : 22, color: '#e0c97e', fontWeight: 700 }}>{result.totalPoints} 分</span>
               </div>
             </div>
           </>
         ) : (
           <>
             <div style={{ fontFamily: 'Inter', fontSize: 11, color: '#8aa699', letterSpacing: 2 }}>HAND COMPLETE</div>
-            <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 32, color: '#e0c97e', marginTop: 6 }}>流局</div>
+            <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 24 : 32, color: '#e0c97e', marginTop: 6 }}>流局</div>
             <div style={{ fontFamily: 'Inter', fontSize: 13, color: '#8aa699', marginTop: 6 }}>Wall exhausted. No winner.</div>
           </>
         )}
         {hideNext ? (
           <div style={{ ...tableStyles.waitingLbl, marginTop: 24, textAlign: 'center' }}>Waiting for host to start next hand…</div>
         ) : (
-          <button style={{ ...tableStyles.actionBtn, ...tableStyles.huBtn, marginTop: 24, width: '100%' }} onClick={onNext}>
+          <button style={{ ...tableStyles.actionBtn(rs), ...tableStyles.huBtn, marginTop: 24, width: '100%' }} onClick={onNext}>
             Continue → Next Hand
           </button>
         )}
@@ -670,13 +767,13 @@ function ScoreModal({ payload, seats, onNext, hideNext }) {
   );
 }
 
-function MatchOver({ scores, seats, onExit }) {
+function MatchOver({ scores, seats, onExit, rs }) {
   const winner = scores.indexOf(Math.max(...scores));
   return (
     <div style={tableStyles.modalWrap}>
-      <div style={tableStyles.modalCard}>
+      <div style={tableStyles.modalCard(rs)}>
         <div style={{ fontFamily: 'Inter', fontSize: 11, color: '#8aa699', letterSpacing: 2 }}>MATCH COMPLETE</div>
-        <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: 40, color: '#e0c97e', marginTop: 10 }}>
+        <div style={{ fontFamily: "'Noto Serif SC', serif", fontSize: rs.isPhone ? 30 : 40, color: '#e0c97e', marginTop: 10 }}>
           {seats[winner].name} 勝
         </div>
         <div style={{ display: 'grid', gap: 8, marginTop: 20 }}>
@@ -689,7 +786,7 @@ function MatchOver({ scores, seats, onExit }) {
             </div>
           ))}
         </div>
-        <button style={{ ...tableStyles.actionBtn, ...tableStyles.huBtn, marginTop: 24, width: '100%' }} onClick={onExit}>
+        <button style={{ ...tableStyles.actionBtn(rs), ...tableStyles.huBtn, marginTop: 24, width: '100%' }} onClick={onExit}>
           Back to Lobby
         </button>
       </div>
@@ -698,7 +795,7 @@ function MatchOver({ scores, seats, onExit }) {
 }
 
 const tableStyles = {
-  root: (tweaks) => ({
+  root: (tweaks, rs) => ({
     position: 'fixed', inset: 0,
     background: tweaks.theme === 'paper'
       ? 'radial-gradient(ellipse at top, #f5f1e8 0%, #d9d4c4 100%)'
@@ -708,29 +805,41 @@ const tableStyles = {
     overflow: 'hidden',
     color: '#e8ebe7',
     fontFamily: 'Inter, system-ui',
+    WebkitTapHighlightColor: 'transparent',
   }),
-  chrome: {
+  chrome: (rs) => ({
     position: 'absolute', top: 0, left: 0, right: 0,
-    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-    padding: '16px 24px', zIndex: 5,
-  },
-  exitBtn: {
+    display: 'flex',
+    flexDirection: rs.isPhone ? 'column' : 'row',
+    justifyContent: 'space-between',
+    alignItems: rs.isPhone ? 'stretch' : 'center',
+    gap: rs.isPhone ? 6 : 0,
+    padding: rs.isPhone ? '8px 10px' : '16px 24px',
+    zIndex: 5,
+  }),
+  chromeLeft: (rs) => ({
+    display: 'flex', alignItems: 'center',
+    gap: rs.isPhone ? 8 : 20,
+    flexWrap: rs.isPhone ? 'wrap' : 'nowrap',
+  }),
+  exitBtn: (rs) => ({
     background: 'rgba(255,255,255,.04)', border: '1px solid #2a3a30',
-    color: '#c3d3ca', borderRadius: 8, padding: '6px 12px',
-    cursor: 'pointer', fontFamily: 'Inter', fontSize: 12,
-  },
-  matchBadge: {
+    color: '#c3d3ca', borderRadius: 8,
+    padding: rs.isPhone ? '4px 8px' : '6px 12px',
+    cursor: 'pointer', fontFamily: 'Inter', fontSize: rs.isPhone ? 14 : 12,
+  }),
+  matchBadge: (rs) => ({
     display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
-    padding: '4px 12px', borderLeft: '2px solid #2a3a30',
-  },
-  wallBadge: {
+    padding: rs.isPhone ? '2px 8px' : '4px 12px', borderLeft: '2px solid #2a3a30',
+  }),
+  wallBadge: (rs) => ({
     display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
-    padding: '4px 12px', borderLeft: '2px solid #2a3a30',
-  },
-  goldenBadge: {
+    padding: rs.isPhone ? '2px 8px' : '4px 12px', borderLeft: '2px solid #2a3a30',
+  }),
+  goldenBadge: (rs) => ({
     display: 'flex', flexDirection: 'column',
-    padding: '4px 12px', borderLeft: '2px solid #2a3a30',
-  },
+    padding: rs.isPhone ? '2px 8px' : '4px 12px', borderLeft: '2px solid #2a3a30',
+  }),
   netPill: {
     fontFamily: 'Inter', fontSize: 10, letterSpacing: 2, color: '#e0c97e',
     padding: '4px 10px', borderLeft: '2px solid #2a3a30',
@@ -740,41 +849,65 @@ const tableStyles = {
     padding: '4px 14px', background: 'rgba(176,48,43,.08)',
     borderRadius: 8, margin: '0 auto 6px', maxWidth: 'fit-content',
   },
-  scoreBadge: {
-    padding: '6px 12px', background: 'rgba(0,0,0,.25)', border: '1px solid #1f2b25',
-    borderRadius: 8, minWidth: 90, transition: 'all .2s',
-  },
+  scoreBadge: (rs) => ({
+    padding: rs.isPhone ? '3px 6px' : '6px 12px',
+    background: 'rgba(0,0,0,.25)', border: '1px solid #1f2b25',
+    borderRadius: 8, transition: 'all .2s',
+  }),
   scoreActive: {
     borderColor: '#e0c97e',
     boxShadow: '0 0 0 1px rgba(224,201,126,.3), 0 0 20px rgba(224,201,126,.2)',
   },
-  tableWrap: {
+  tableWrap: (rs) => ({
     position: 'absolute', inset: 0,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
-    perspective: 1800, paddingTop: 60,
-  },
-  felt: (tweaks) => ({
+    perspective: rs.isPhone ? 0 : 1800,
+    paddingTop: rs.isPhone ? 70 : 60,
+    paddingBottom: rs.isPhone ? 140 : 0,
+  }),
+  felt: (tweaks, rs) => ({
     position: 'relative',
-    width: 'min(1100px, 95vw)', height: 'min(720px, 82vh)',
-    borderRadius: 24,
+    width: rs.isPhone ? '100%' : 'min(1100px, 95vw)',
+    height: rs.isPhone ? '100%' : 'min(720px, 82vh)',
+    borderRadius: rs.isPhone ? 0 : 24,
     background: tweaks.theme === 'paper'
       ? 'radial-gradient(ellipse at center, #f5f1e8 0%, #e8e3d2 100%)'
       : tweaks.theme === 'traditional'
       ? 'radial-gradient(ellipse at center, #2c5a3a 0%, #1a3f26 100%)'
       : 'radial-gradient(ellipse at center, #1c4530 0%, #0e2a1d 70%, #081812 100%)',
-    boxShadow: tweaks.theme === 'paper'
-      ? 'inset 0 0 60px rgba(0,0,0,.08), 0 20px 60px rgba(0,0,0,.4)'
-      : 'inset 0 0 80px rgba(0,0,0,.5), 0 20px 60px rgba(0,0,0,.6), inset 0 2px 0 rgba(255,255,255,.04)',
-    transform: tweaks.tilt !== false ? 'rotateX(10deg)' : 'none',
+    boxShadow: rs.isPhone
+      ? 'none'
+      : tweaks.theme === 'paper'
+        ? 'inset 0 0 60px rgba(0,0,0,.08), 0 20px 60px rgba(0,0,0,.4)'
+        : 'inset 0 0 80px rgba(0,0,0,.5), 0 20px 60px rgba(0,0,0,.6), inset 0 2px 0 rgba(255,255,255,.04)',
+    transform: (rs.isPhone || tweaks.tilt === false) ? 'none' : 'rotateX(10deg)',
     transformStyle: 'preserve-3d',
     transition: 'transform .3s',
-    border: tweaks.theme === 'paper' ? '1px solid #c8c0a8' : '1px solid #2a4a38',
+    border: rs.isPhone ? 'none' : (tweaks.theme === 'paper' ? '1px solid #c8c0a8' : '1px solid #2a4a38'),
   }),
-  opponentBlock: (pos) => {
+  opponentBlock: (pos, rs) => {
     const base = { position: 'absolute', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 };
-    if (pos === 'top') return { ...base, top: 16, left: '50%', transform: 'translateX(-50%)' };
-    if (pos === 'left') return { ...base, left: 16, top: '50%', transform: 'translateY(-50%)' };
-    if (pos === 'right') return { ...base, right: 16, top: '50%', transform: 'translateY(-50%)' };
+    const inset = rs && rs.isTablet ? 8 : 16;
+    if (pos === 'top') return { ...base, top: inset, left: '50%', transform: 'translateX(-50%)' };
+    if (pos === 'left') return { ...base, left: inset, top: '50%', transform: 'translateY(-50%)' };
+    if (pos === 'right') return { ...base, right: inset, top: '50%', transform: 'translateY(-50%)' };
+    return base;
+  },
+  opponentPill: (pos, active) => {
+    // On phone, opponents become horizontal pills along the top.
+    const base = {
+      position: 'absolute', display: 'flex', alignItems: 'center', gap: 6,
+      padding: '4px 8px',
+      background: active ? 'rgba(224,201,126,.12)' : 'rgba(0,0,0,.45)',
+      border: `1px solid ${active ? 'rgba(224,201,126,.55)' : '#2a3a30'}`,
+      borderRadius: 12,
+      whiteSpace: 'nowrap',
+      maxWidth: '46%',
+      overflow: 'hidden',
+    };
+    if (pos === 'top') return { ...base, top: 6, left: '50%', transform: 'translateX(-50%)' };
+    if (pos === 'left') return { ...base, top: 42, left: 6 };
+    if (pos === 'right') return { ...base, top: 42, right: 6 };
     return base;
   },
   opponentLabel: (pos, active) => ({
@@ -785,40 +918,61 @@ const tableStyles = {
     borderRadius: 16, whiteSpace: 'nowrap',
   }),
   turnDot: { width: 6, height: 6, borderRadius: '50%', background: '#e0c97e', boxShadow: '0 0 8px #e0c97e' },
-  pond: {
-    position: 'absolute', inset: '20% 22%',
+  pond: (rs) => ({
+    position: 'absolute',
+    inset: rs.isPhone ? '84px 8px 180px 8px' : rs.isTablet ? '16% 18%' : '20% 22%',
     display: 'grid',
     gridTemplateRows: '1fr 1fr 1fr',
     gridTemplateColumns: '1fr 1fr 1fr',
     gridTemplateAreas: '"tl top tr" "left center right" "bl bot br"',
     pointerEvents: 'none',
-  },
-  centerDisc: {
+  }),
+  centerDisc: (rs) => ({
     gridArea: 'center',
     display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
     background: 'rgba(0,0,0,.2)',
     border: '1px solid rgba(193,169,109,.15)',
     borderRadius: '50%',
-    width: 120, height: 120, margin: 'auto',
-  },
-  mySeat: {
+    width: rs.isTablet ? 80 : 120, height: rs.isTablet ? 80 : 120, margin: 'auto',
+  }),
+  mySeat: (rs) => ({
     position: 'absolute',
-    bottom: 16, left: '50%', transform: 'translateX(-50%) translateZ(30px)',
-    display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10,
+    bottom: rs.isPhone ? 8 : 16,
+    left: '50%',
+    transform: rs.isPhone ? 'translateX(-50%)' : 'translateX(-50%) translateZ(30px)',
+    display: 'flex', flexDirection: 'column', alignItems: 'center', gap: rs.isPhone ? 6 : 10,
     width: '100%', pointerEvents: 'auto',
-  },
-  myHand: {
-    display: 'flex', gap: 3, alignItems: 'flex-end',
-    padding: '12px 20px', background: 'rgba(0,0,0,.2)',
-    borderRadius: 12, backdropFilter: 'blur(4px)',
-  },
-  actionBar: { display: 'flex', gap: 10, alignItems: 'center', minHeight: 44 },
-  actionBtn: {
+  }),
+  myHand: (rs) => ({
+    display: 'flex',
+    gap: rs.isPhone ? 2 : 3,
+    alignItems: 'flex-end',
+    padding: rs.isPhone ? '6px 8px' : '12px 20px',
+    background: 'rgba(0,0,0,.2)',
+    borderRadius: rs.isPhone ? 8 : 12,
+    backdropFilter: 'blur(4px)',
+    maxWidth: '100%',
+    overflowX: rs.isPhone ? 'auto' : 'visible',
+    overflowY: 'visible',
+    WebkitOverflowScrolling: 'touch',
+    scrollbarWidth: 'thin',
+  }),
+  actionBar: (rs) => ({
+    display: 'flex', gap: rs.isPhone ? 6 : 10,
+    alignItems: 'center',
+    minHeight: rs.isPhone ? 36 : 44,
+    flexWrap: 'wrap', justifyContent: 'center',
+    padding: rs.isPhone ? '0 8px' : 0,
+  }),
+  actionBtn: (rs) => ({
     background: 'rgba(0,0,0,.4)', border: '1px solid #2a3a30',
-    color: '#e8ebe7', padding: '10px 18px', borderRadius: 8,
-    fontFamily: 'Inter', fontSize: 13, fontWeight: 600,
+    color: '#e8ebe7',
+    padding: rs.isPhone ? '8px 14px' : '10px 18px',
+    borderRadius: 8,
+    fontFamily: 'Inter', fontSize: rs.isPhone ? 12 : 13, fontWeight: 600,
     cursor: 'pointer', letterSpacing: 1,
-  },
+    minHeight: rs.isPhone ? 36 : 40,
+  }),
   huBtn: {
     background: 'linear-gradient(180deg, #c9a14a 0%, #8a6d2f 100%)',
     border: '1px solid #e0c97e', color: '#1a1a1a', fontWeight: 700,
@@ -829,30 +983,40 @@ const tableStyles = {
   },
   waitingLbl: {
     fontFamily: 'Inter', fontSize: 11, color: '#6a8578', letterSpacing: 2, textTransform: 'uppercase',
+    textAlign: 'center',
   },
-  claimOverlay: {
-    position: 'fixed', bottom: 120, left: '50%', transform: 'translateX(-50%)',
+  claimOverlay: (rs) => ({
+    position: 'fixed',
+    bottom: rs.isPhone ? 150 : 120,
+    left: '50%', transform: 'translateX(-50%)',
     zIndex: 20,
-  },
-  claimBox: {
+    width: rs.isPhone ? 'calc(100% - 16px)' : 'auto',
+    maxWidth: rs.isPhone ? 'none' : '92vw',
+  }),
+  claimBox: (rs) => ({
     background: 'linear-gradient(180deg, #151c18 0%, #0e1512 100%)',
-    border: '1px solid #e0c97e', borderRadius: 16, padding: 20,
+    border: '1px solid #e0c97e', borderRadius: 16,
+    padding: rs.isPhone ? 14 : 20,
     boxShadow: '0 20px 40px rgba(0,0,0,.6), 0 0 40px rgba(224,201,126,.1)',
-  },
-  log: {
+  }),
+  log: (rs) => ({
     position: 'absolute', left: 16, bottom: 16,
     display: 'flex', flexDirection: 'column', gap: 2,
     maxWidth: 200, pointerEvents: 'none',
-  },
+  }),
   modalWrap: {
     position: 'fixed', inset: 0, background: 'rgba(5,8,10,.7)', backdropFilter: 'blur(6px)',
     display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 30,
+    padding: 12,
   },
-  modalCard: {
+  modalCard: (rs) => ({
     background: 'linear-gradient(180deg, #151c18 0%, #0e1512 100%)',
-    border: '1px solid #2a3a30', borderRadius: 16, padding: 28,
-    width: 'min(420px, 92vw)', boxShadow: '0 30px 80px rgba(0,0,0,.6)',
-  },
+    border: '1px solid #2a3a30', borderRadius: 16,
+    padding: rs.isPhone ? 20 : 28,
+    width: rs.isPhone ? '100%' : 'min(420px, 92vw)',
+    maxHeight: '92vh', overflowY: 'auto',
+    boxShadow: '0 30px 80px rgba(0,0,0,.6)',
+  }),
   fanRow: {
     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
     padding: '6px 0',

@@ -9,6 +9,20 @@ function makeRoomId() {
   return `fzmj-${s}`;
 }
 
+// Persistent per-browser ID so a disconnect can be rebound to the same seat.
+function getClientId() {
+  try {
+    let id = localStorage.getItem('mj_client_id');
+    if (!id) {
+      id = 'c_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+      localStorage.setItem('mj_client_id', id);
+    }
+    return id;
+  } catch {
+    return 'c_' + Math.random().toString(36).slice(2, 10);
+  }
+}
+
 function getRoomFromHash() {
   if (typeof window === 'undefined') return null;
   const m = window.location.hash.match(/room=([a-zA-Z0-9-]+)/);
@@ -79,40 +93,73 @@ async function hostRoom({ roomId, onConnect, onMessage, onDisconnect, onError })
 }
 
 // Joiner: connects to a host by room ID.
-async function joinRoom({ roomId, onMessage, onClose, onError }) {
+// Supports silent reconnect: if the data channel drops, we try to reopen it on the same peer and
+// fire `onReconnect` so the app can re-send its hello and pick up where it left off.
+async function joinRoom({ roomId, onMessage, onClose, onError, onReconnect }) {
   if (!window.Peer) throw new Error('PeerJS failed to load (CDN blocked?)');
   const peer = new window.Peer(peerOpts());
-  const handlers = { onMessage, onClose, onError };
+  const handlers = { onMessage, onClose, onError, onReconnect };
+  const state = { conn: null, closed: false, reconnecting: false };
+
   await new Promise((resolve, reject) => {
     peer.once('open', () => resolve());
     peer.once('error', (e) => reject(e));
     setTimeout(() => reject(new Error('Peer open timeout — signalling broker unreachable.')), 10000);
   });
-  const conn = peer.connect(roomId, { reliable: true });
-  await new Promise((resolve, reject) => {
+
+  const wireConn = (conn) => {
+    state.conn = conn;
+    conn.on('data', (data) => handlers.onMessage && handlers.onMessage(data));
+    conn.on('close', () => {
+      if (state.closed) return;
+      handlers.onClose && handlers.onClose();
+      tryReconnect();
+    });
+    conn.on('error', (e) => handlers.onError && handlers.onError(e));
+  };
+
+  const openConn = () => new Promise((resolve, reject) => {
     let settled = false;
-    conn.once('open', () => { if (!settled) { settled = true; resolve(); } });
-    conn.once('error', (e) => { if (!settled) { settled = true; reject(e); } });
+    const c = peer.connect(roomId, { reliable: true });
+    c.once('open', () => { if (!settled) { settled = true; resolve(c); } });
+    c.once('error', (e) => { if (!settled) { settled = true; reject(e); } });
     setTimeout(() => { if (!settled) { settled = true; reject(new Error('Could not reach host — check the room code.')); } }, 15000);
   });
-  conn.on('data', (data) => handlers.onMessage && handlers.onMessage(data));
-  conn.on('close', () => handlers.onClose && handlers.onClose());
-  conn.on('error', (e) => handlers.onError && handlers.onError(e));
+
+  const tryReconnect = async () => {
+    if (state.closed || state.reconnecting) return;
+    state.reconnecting = true;
+    for (let attempt = 0; attempt < 10 && !state.closed; attempt++) {
+      const wait = Math.min(800 * (attempt + 1), 5000);
+      await new Promise((r) => setTimeout(r, wait));
+      try {
+        const c = await openConn();
+        wireConn(c);
+        state.reconnecting = false;
+        handlers.onReconnect && handlers.onReconnect();
+        return;
+      } catch {}
+    }
+    state.reconnecting = false;
+  };
+
+  const initial = await openConn();
+  wireConn(initial);
   peer.on('error', (e) => handlers.onError && handlers.onError(e));
 
   return {
     role: 'client',
     peer,
-    conn,
+    get conn() { return state.conn; },
     peerId: peer.id,
     roomId,
     handlers,
-    send(msg) { try { conn.send(msg); } catch {} },
-    close() { try { peer.destroy(); } catch {} },
+    send(msg) { try { if (state.conn) state.conn.send(msg); } catch {} },
+    close() { state.closed = true; try { peer.destroy(); } catch {} },
   };
 }
 
 Object.assign(window, {
   makeRoomId, getRoomFromHash, setRoomInHash, inviteUrl,
-  hostRoom, joinRoom,
+  hostRoom, joinRoom, getClientId,
 });
